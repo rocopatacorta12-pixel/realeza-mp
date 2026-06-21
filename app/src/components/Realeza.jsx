@@ -77,12 +77,15 @@ const PIECE_DATA = {
 const PIECE_ORDER = ['monarca','caballero','hechicera','fortaleza','jinete','druida','infante'];
 
 const DIFFICULTY_LEVELS = {
-  muy_facil:  { label: 'Muy fácil', depth: 1, randomness: 0.65, abilities: 'none' },
-  facil:      { label: 'Fácil',     depth: 1, randomness: 0.25, abilities: 'none' },
-  normal:     { label: 'Normal',    depth: 2, randomness: 0.08, abilities: 'basic' },
-  dificil:    { label: 'Difícil',   depth: 2, randomness: 0.0,  abilities: 'all'   },
-  experto:    { label: 'Experto',   depth: 3, randomness: 0.0,  abilities: 'all'   },
-  invencible: { label: 'Invencible',depth: 3, randomness: 0.0,  abilities: 'all', positional: true },
+  muy_facil:  { label: 'Muy fácil', depth: 1, randomness: 0.65, abilities: 'none', positional: false, advanced: false },
+  facil:      { label: 'Fácil',     depth: 1, randomness: 0.25, abilities: 'none', positional: false, advanced: false },
+  normal:     { label: 'Normal',    depth: 2, randomness: 0.08, abilities: 'basic', positional: false, advanced: false },
+  // Difícil: ~20% chance de ganarle. depth 3, evaluación con consideraciones tácticas
+  dificil:    { label: 'Difícil',   depth: 3, randomness: 0.02, abilities: 'all', positional: true,  advanced: false },
+  // Experto: ~10% chance. depth 3 con evaluación más profunda + amenazas
+  experto:    { label: 'Experto',   depth: 3, randomness: 0.0,  abilities: 'all', positional: true,  advanced: true,  threatEval: true },
+  // Invencible: ~0.05% chance. depth 4 con evaluación completísima + amenazas + control del centro
+  invencible: { label: 'Invencible',depth: 4, randomness: 0.0,  abilities: 'all', positional: true,  advanced: true,  threatEval: true, kingSafety: true },
 };
 
 const COLORS = {
@@ -198,23 +201,131 @@ function applyMoveSim(board, from, to) {
   return nb;
 }
 
-function evalBoard(board, color, positional) {
+// Piece-square tables: bonus por centralidad para cada tipo
+// Mayor valor en el centro del tablero (r=4,c=4)
+function pstBonus(piece, r, c) {
+  const cdist = Math.abs(r - 4) + Math.abs(c - 4);
+  const central = (8 - cdist) * 0.08;
+  if (piece.type === 'jinete' || piece.type === 'caballero') return central * 1.5;
+  if (piece.type === 'hechicera' || piece.type === 'fortaleza') return central * 1.2;
+  if (piece.type === 'druida') return central;
+  return central * 0.5;
+}
+
+function evalBoard(board, color, opts) {
+  const positional = opts && opts.positional;
+  const threatEval = opts && opts.threatEval;
+  const kingSafety = opts && opts.kingSafety;
+  const advanced = opts && opts.advanced;
+
   let s = 0;
+  let kingPosMe = null, kingPosEnemy = null;
+  const enemy = color === 'gold' ? 'crimson' : 'gold';
+
+  // Conteo base de material + PST
   for (let r = 0; r < BOARD_SIZE; r++) {
     for (let c = 0; c < BOARD_SIZE; c++) {
       const p = board[r][c];
       if (!p) continue;
       let v = PIECE_DATA[p.type].value;
       if (positional) {
-        const centerDist = Math.abs(r-4) + Math.abs(c-4);
-        v += (8 - centerDist) * 0.1;
+        v += pstBonus(p, r, c);
         if (p.type === 'infante') {
-          v += p.color === 'gold' ? (8-r)*0.15 : r*0.15;
+          // Bonus por avance del infante (cerca de promocionar)
+          v += p.color === 'gold' ? (8 - r) * 0.18 : r * 0.18;
         }
+      }
+      if (p.type === 'monarca') {
+        if (p.color === color) kingPosMe = [r, c];
+        else kingPosEnemy = [r, c];
       }
       s += (p.color === color ? v : -v);
     }
   }
+
+  if (!threatEval && !kingSafety) return s;
+
+  // Evaluación de amenazas: piezas atacadas/defendidas
+  if (threatEval) {
+    // Generar todos los movimientos posibles de ambos colores (incluye capturas)
+    // Si una pieza propia está atacada y no defendida, penalizar
+    // Si una pieza enemiga está atacada por nosotros, bonificar
+    const myThreats = new Map();   // "r,c" -> attack count by us
+    const enemyThreats = new Map();// "r,c" -> attack count by enemy
+
+    for (let r = 0; r < BOARD_SIZE; r++) {
+      for (let c = 0; c < BOARD_SIZE; c++) {
+        const p = board[r][c];
+        if (!p) continue;
+        const moves = getRawMoves(board, r, c);
+        for (const [nr, nc] of moves) {
+          const key = `${nr},${nc}`;
+          if (p.color === color) {
+            myThreats.set(key, (myThreats.get(key) || 0) + 1);
+          } else {
+            enemyThreats.set(key, (enemyThreats.get(key) || 0) + 1);
+          }
+        }
+      }
+    }
+
+    // Bonificar piezas enemigas atacadas
+    for (let r = 0; r < BOARD_SIZE; r++) {
+      for (let c = 0; c < BOARD_SIZE; c++) {
+        const p = board[r][c];
+        if (!p) continue;
+        const key = `${r},${c}`;
+        const attackedByMe = myThreats.get(key) || 0;
+        const attackedByEnemy = enemyThreats.get(key) || 0;
+        const v = PIECE_DATA[p.type].value;
+        if (p.color === enemy && attackedByMe > 0) {
+          // Pieza enemiga atacada: bonus proporcional a su valor
+          s += v * 0.15;
+        }
+        if (p.color === color && attackedByEnemy > 0) {
+          // Pieza propia atacada
+          if (attackedByMe === 0) {
+            // Sin defensa: penalización fuerte
+            s -= v * 0.45;
+          } else {
+            s -= v * 0.1;
+          }
+        }
+      }
+    }
+  }
+
+  // Seguridad del monarca: penalizar exposición
+  if (kingSafety && kingPosMe) {
+    const [kr, kc] = kingPosMe;
+    // Contar piezas amigas adyacentes (escudo)
+    let shield = 0;
+    for (const [dr, dc] of DIR8) {
+      const nr = kr + dr, nc = kc + dc;
+      if (inBounds(nr, nc) && board[nr][nc] && board[nr][nc].color === color) {
+        shield++;
+      }
+    }
+    s += shield * 0.25;
+    // Penalizar monarca en el centro temprano (más expuesto)
+    const cdist = Math.abs(kr - 4) + Math.abs(kc - 4);
+    if (cdist <= 2) s -= 0.4;
+  }
+  if (kingSafety && kingPosEnemy) {
+    // Bonificar acercamiento al rey enemigo (para piezas activas)
+    let attackersNear = 0;
+    const [ekr, ekc] = kingPosEnemy;
+    for (let r = 0; r < BOARD_SIZE; r++) {
+      for (let c = 0; c < BOARD_SIZE; c++) {
+        const p = board[r][c];
+        if (!p || p.color !== color) continue;
+        const dist = Math.abs(r - ekr) + Math.abs(c - ekc);
+        if (dist <= 3 && p.type !== 'infante') attackersNear++;
+      }
+    }
+    s += attackersNear * 0.15;
+  }
+
   return s;
 }
 
@@ -238,23 +349,27 @@ function kingExists(board, color) {
   return false;
 }
 
-function minimax(board, depth, alpha, beta, maxColor, curColor, positional) {
-  if (!kingExists(board, maxColor)) return { score: -100000 };
+function minimax(board, depth, alpha, beta, maxColor, curColor, opts) {
+  if (!kingExists(board, maxColor)) return { score: -100000 - depth };
   const otherColor = maxColor === 'gold' ? 'crimson' : 'gold';
-  if (!kingExists(board, otherColor)) return { score: 100000 };
-  if (depth === 0) return { score: evalBoard(board, maxColor, positional) };
+  if (!kingExists(board, otherColor)) return { score: 100000 + depth };
+  if (depth === 0) return { score: evalBoard(board, maxColor, opts) };
   const moves = findAllMovesForColor(board, curColor);
-  if (moves.length === 0) return { score: evalBoard(board, maxColor, positional) };
-  for (let i = moves.length-1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i+1));
-    [moves[i], moves[j]] = [moves[j], moves[i]];
+  if (moves.length === 0) return { score: evalBoard(board, maxColor, opts) };
+
+  // Move ordering: priorizar capturas (más valiosas primero) para mejor poda alpha-beta
+  for (const m of moves) {
+    const target = board[m.to[0]][m.to[1]];
+    m._score = target ? PIECE_DATA[target.type].value * 10 : 0;
   }
+  moves.sort((a, b) => b._score - a._score);
+
   let best = null;
   if (curColor === maxColor) {
     let v = -Infinity;
     for (const m of moves) {
       const nb = applyMoveSim(board, m.from, m.to);
-      const r = minimax(nb, depth-1, alpha, beta, maxColor, curColor === 'gold' ? 'crimson' : 'gold', positional);
+      const r = minimax(nb, depth - 1, alpha, beta, maxColor, curColor === 'gold' ? 'crimson' : 'gold', opts);
       if (r.score > v) { v = r.score; best = m; }
       alpha = Math.max(alpha, v);
       if (beta <= alpha) break;
@@ -264,7 +379,7 @@ function minimax(board, depth, alpha, beta, maxColor, curColor, positional) {
     let v = Infinity;
     for (const m of moves) {
       const nb = applyMoveSim(board, m.from, m.to);
-      const r = minimax(nb, depth-1, alpha, beta, maxColor, curColor === 'gold' ? 'crimson' : 'gold', positional);
+      const r = minimax(nb, depth - 1, alpha, beta, maxColor, curColor === 'gold' ? 'crimson' : 'gold', opts);
       if (r.score < v) { v = r.score; best = m; }
       beta = Math.min(beta, v);
       if (beta <= alpha) break;
@@ -277,10 +392,17 @@ function aiChooseRegularMove(board, color, difficulty) {
   const cfg = DIFFICULTY_LEVELS[difficulty];
   const moves = findAllMovesForColor(board, color);
   if (moves.length === 0) return null;
-  if (Math.random() < cfg.randomness) {
+  if (cfg.randomness > 0 && Math.random() < cfg.randomness) {
     return moves[Math.floor(Math.random() * moves.length)];
   }
-  return minimax(board, cfg.depth, -Infinity, Infinity, color, color, !!cfg.positional).move;
+  const opts = {
+    positional: !!cfg.positional,
+    threatEval: !!cfg.threatEval,
+    kingSafety: !!cfg.kingSafety,
+    advanced: !!cfg.advanced,
+  };
+  const result = minimax(board, cfg.depth, -Infinity, Infinity, color, color, opts);
+  return result.move;
 }
 
 // AI ability selection
@@ -424,6 +546,42 @@ function findAIAbility(board, color, cooldowns, oncePerGame, difficulty, turnNum
 
 let synths = null;
 let audioStarted = false;
+let ambientLoop = null;
+let ambientPlayer = null;
+
+// === Toggles globales (persistidos en localStorage) ===
+function getStoredBool(key, defaultVal) {
+  try {
+    if (typeof window === 'undefined') return defaultVal;
+    const v = window.localStorage.getItem(key);
+    if (v === null) return defaultVal;
+    return v === 'true';
+  } catch (_) { return defaultVal; }
+}
+function setStoredBool(key, val) {
+  try {
+    if (typeof window === 'undefined') return;
+    window.localStorage.setItem(key, val ? 'true' : 'false');
+  } catch (_) {}
+}
+
+const soundConfig = {
+  // sonidos de movimientos/habilidades/capturas/victoria
+  effects: getStoredBool('realeza_sfx', true),
+  // música ambiente acogedora en menú/durante el juego
+  ambient: getStoredBool('realeza_ambient', true),
+};
+
+function setEffects(on) {
+  soundConfig.effects = on;
+  setStoredBool('realeza_sfx', on);
+}
+function setAmbient(on) {
+  soundConfig.ambient = on;
+  setStoredBool('realeza_ambient', on);
+  if (on) startAmbient();
+  else stopAmbient();
+}
 
 async function ensureAudio() {
   if (audioStarted) return;
@@ -431,7 +589,74 @@ async function ensureAudio() {
     await Tone.start();
     audioStarted = true;
     if (!synths) initSynths();
+    if (soundConfig.ambient) startAmbient();
   } catch (e) { console.warn(e); }
+}
+
+// === Música ambiente: acordes suaves, etéreos, en loop ===
+let ambientSynth = null;
+let ambientPad = null;
+let ambientReverb = null;
+let ambientInterval = null;
+
+function startAmbient() {
+  if (!audioStarted || !soundConfig.ambient) return;
+  if (ambientInterval) return; // ya está sonando
+  try {
+    if (!ambientReverb) {
+      ambientReverb = new Tone.Reverb({ decay: 6, wet: 0.5 }).toDestination();
+    }
+    if (!ambientPad) {
+      ambientPad = new Tone.PolySynth(Tone.Synth, {
+        oscillator: { type: 'sine' },
+        envelope: { attack: 2.0, decay: 1.0, sustain: 0.7, release: 4.0 },
+      }).connect(ambientReverb);
+      ambientPad.volume.value = -28;
+    }
+    if (!ambientSynth) {
+      ambientSynth = new Tone.PolySynth(Tone.Synth, {
+        oscillator: { type: 'triangle' },
+        envelope: { attack: 1.5, decay: 0.8, sustain: 0.5, release: 3.0 },
+      }).connect(ambientReverb);
+      ambientSynth.volume.value = -32;
+    }
+
+    // Progresión simple en Re menor: ambiente medieval/regal suave
+    const progression = [
+      ['D3', 'F3', 'A3'],   // Dm
+      ['Bb2', 'D3', 'F3'],  // Bb
+      ['F3', 'A3', 'C4'],   // F
+      ['A2', 'C3', 'E3'],   // Am
+    ];
+    let idx = 0;
+    const playChord = () => {
+      if (!soundConfig.ambient || !ambientPad) return;
+      try {
+        ambientPad.triggerAttackRelease(progression[idx], '2n', undefined, 0.3);
+        // Melodía superior suave ocasional
+        if (idx % 2 === 0) {
+          const melody = progression[idx][2]; // nota superior
+          setTimeout(() => {
+            if (soundConfig.ambient && ambientSynth) {
+              try { ambientSynth.triggerAttackRelease(melody, '4n', undefined, 0.25); } catch (_) {}
+            }
+          }, 800);
+        }
+      } catch (_) {}
+      idx = (idx + 1) % progression.length;
+    };
+    playChord();
+    ambientInterval = setInterval(playChord, 3500);
+  } catch (e) { console.warn('Ambient start failed', e); }
+}
+
+function stopAmbient() {
+  if (ambientInterval) {
+    clearInterval(ambientInterval);
+    ambientInterval = null;
+  }
+  try { if (ambientPad) ambientPad.releaseAll(); } catch (_) {}
+  try { if (ambientSynth) ambientSynth.releaseAll(); } catch (_) {}
 }
 
 function initSynths() {
@@ -500,17 +725,18 @@ function initSynths() {
   synths.bell.volume.value = -16;
 }
 
-function safe(fn) { try { if (synths) fn(); } catch (e) {} }
+function safe(fn) { try { if (synths && soundConfig.effects) fn(); } catch (e) {} }
 function delay(ms, fn) { setTimeout(() => safe(fn), ms); }
 
 // === Select sound ===
 function playSelect() {
+  if (!soundConfig.effects) return;
   safe(() => synths.click.triggerAttackRelease("16n"));
 }
 
 // === Move sounds (per piece type) ===
 function playMoveSound(pieceType) {
-  if (!synths) return;
+  if (!synths || !soundConfig.effects) return;
   switch (pieceType) {
     case 'monarca':
       // Deep regal step + soft echo
@@ -553,7 +779,7 @@ function playMoveSound(pieceType) {
 
 // === Capture sounds ===
 function playRegularCapture() {
-  if (!synths) return;
+  if (!synths || !soundConfig.effects) return;
   safe(() => synths.boom.triggerAttackRelease("C2", "8n"));
   delay(30, () => synths.noise.triggerAttackRelease("16n"));
   delay(60, () => synths.sharp.triggerAttackRelease("32n"));
@@ -561,7 +787,7 @@ function playRegularCapture() {
 
 // === KING CAPTURE - dramatic, distinct from regular capture ===
 function playKingCapture() {
-  if (!synths) return;
+  if (!synths || !soundConfig.effects) return;
   // Triple boom impact
   safe(() => synths.boom.triggerAttackRelease("C1", "4n"));
   safe(() => synths.noise.triggerAttackRelease("4n"));
@@ -576,7 +802,7 @@ function playKingCapture() {
 
 // === Ability sounds (one per ability, all distinct) ===
 function playAbility(abilityType) {
-  if (!synths) return;
+  if (!synths || !soundConfig.effects) return;
   switch (abilityType) {
     case 'monarca': {
       // SALTO REAL - regal horn fanfare ascending
@@ -646,7 +872,7 @@ function playAbility(abilityType) {
 }
 
 function playVictory() {
-  if (!synths) return;
+  if (!synths || !soundConfig.effects) return;
   const notes = ["C4","E4","G4","C5","E5","G5","C6","E6"];
   notes.forEach((n, i) => {
     delay(i * 110, () => synths.horn.triggerAttackRelease(n, "8n", undefined, 0.55));
@@ -656,7 +882,7 @@ function playVictory() {
 }
 
 function playDefeat() {
-  if (!synths) return;
+  if (!synths || !soundConfig.effects) return;
   ["F3","Db3","Bb2","F2","C2"].forEach((n, i) => {
     delay(i * 380, () => synths.dark.triggerAttackRelease(n, "2n", undefined, 0.5));
   });
@@ -749,7 +975,7 @@ function MovePatternGrid({ pieceType }) {
   );
 }
 
-function PieceCard({ pieceType }) {
+function PieceCard({ pieceType, onZoom }) {
   const data = PIECE_DATA[pieceType];
   return (
     <div style={{
@@ -767,7 +993,26 @@ function PieceCard({ pieceType }) {
         }}>NUEVA</div>
       )}
       <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-        <PieceImage piece={{type: pieceType, color: 'gold'}} size={56} />
+        <button
+          onClick={() => onZoom && onZoom(pieceType)}
+          aria-label={`Ver ${data.name} en grande`}
+          style={{
+            padding: 0, background: 'transparent', border: 'none', cursor: 'zoom-in',
+            borderRadius: '50%',
+          }}>
+          <div style={{ position: 'relative' }}>
+            <PieceImage piece={{type: pieceType, color: 'gold'}} size={56} />
+            <div style={{
+              position: 'absolute', bottom: -2, right: -2,
+              background: COLORS.gold, color: '#1A1410',
+              width: 18, height: 18, borderRadius: '50%',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 12, fontWeight: 700, lineHeight: 1,
+              border: `1px solid #1A1410`,
+              boxShadow: '0 1px 3px rgba(0,0,0,0.5)',
+            }}>🔍</div>
+          </div>
+        </button>
         <div>
           <div style={{
             fontFamily: 'Cinzel, serif', fontSize: 22, fontWeight: 700,
@@ -805,11 +1050,127 @@ function PieceCard({ pieceType }) {
   );
 }
 
-function PiezasTab() {
+function PieceZoomModal({ pieceType, onClose }) {
+  // Cerrar con tecla Escape (hook DEBE ir antes de cualquier early return)
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const data = PIECE_DATA[pieceType];
+  if (!pieceType) return null;
+
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 16 }}>
-      {PIECE_ORDER.map(pt => <PieceCard key={pt} pieceType={pt} />)}
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed', inset: 0,
+        background: 'rgba(0,0,0,0.88)',
+        backdropFilter: 'blur(6px)',
+        WebkitBackdropFilter: 'blur(6px)',
+        zIndex: 1000,
+        display: 'flex', flexDirection: 'column',
+        alignItems: 'center', justifyContent: 'center',
+        padding: 20, cursor: 'zoom-out',
+      }}>
+      <div onClick={(e) => e.stopPropagation()}
+        style={{
+          background: `linear-gradient(160deg, ${COLORS.card} 0%, ${COLORS.cardLight} 100%)`,
+          borderRadius: 14,
+          padding: 24,
+          maxWidth: 520, width: '100%',
+          border: `2px solid ${COLORS.gold}`,
+          boxShadow: `0 8px 40px rgba(0,0,0,0.7), 0 0 0 1px ${COLORS.gold}33`,
+          cursor: 'default', position: 'relative',
+        }}>
+        <button
+          onClick={onClose}
+          aria-label="Cerrar"
+          style={{
+            position: 'absolute', top: 10, right: 10,
+            background: 'transparent', border: 'none',
+            color: COLORS.ink, fontSize: 26, cursor: 'pointer',
+            width: 36, height: 36, borderRadius: '50%',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            lineHeight: 1,
+          }}>×</button>
+
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14 }}>
+          {/* Pareja de retratos en grande: Dorado y Carmesí */}
+          <div style={{ display: 'flex', gap: 18, justifyContent: 'center', alignItems: 'center' }}>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{
+                width: 160, height: 160, borderRadius: '50%',
+                backgroundImage: `url(${PIECE_IMAGES[`${pieceType}_gold`]})`,
+                backgroundSize: 'cover', backgroundPosition: 'center',
+                boxShadow: `0 0 0 3px ${COLORS.gold}, 0 6px 20px rgba(0,0,0,0.6)`,
+              }}/>
+              <div style={{
+                marginTop: 6, fontFamily: 'Cinzel, serif',
+                fontSize: 11, letterSpacing: 2, color: COLORS.gold, fontWeight: 600,
+              }}>DORADO</div>
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{
+                width: 160, height: 160, borderRadius: '50%',
+                backgroundImage: `url(${PIECE_IMAGES[`${pieceType}_crimson`]})`,
+                backgroundSize: 'cover', backgroundPosition: 'center',
+                boxShadow: `0 0 0 3px ${COLORS.crimson}, 0 6px 20px rgba(0,0,0,0.6)`,
+              }}/>
+              <div style={{
+                marginTop: 6, fontFamily: 'Cinzel, serif',
+                fontSize: 11, letterSpacing: 2, color: COLORS.crimson, fontWeight: 600,
+              }}>CARMESÍ</div>
+            </div>
+          </div>
+
+          <h2 style={{
+            fontFamily: 'Cinzel, serif', fontSize: 28, fontWeight: 700,
+            color: COLORS.ink, letterSpacing: 3, margin: '4px 0 0',
+            textAlign: 'center',
+          }}>{data.name}</h2>
+
+          <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div>
+              <div style={{
+                fontSize: 10, letterSpacing: 1.5, color: COLORS.gold,
+                fontFamily: 'Cinzel, serif', fontWeight: 600, marginBottom: 3,
+              }}>MOVIMIENTO</div>
+              <div style={{ fontSize: 13.5, color: COLORS.ink, lineHeight: 1.5 }}>{data.movement}</div>
+            </div>
+            <div style={{
+              background: COLORS.bg, borderLeft: `3px solid ${COLORS.gold}`,
+              padding: '10px 14px', borderRadius: 4,
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4, flexWrap: 'wrap', gap: 6 }}>
+                <div style={{
+                  fontFamily: 'Cinzel, serif', fontSize: 14, fontWeight: 600,
+                  color: COLORS.gold, letterSpacing: 1,
+                }}>⚜ {data.abilityName}</div>
+                <div style={{
+                  fontSize: 10, letterSpacing: 1, color: COLORS.inkMute, fontFamily: 'monospace',
+                  background: COLORS.card, padding: '2px 8px', borderRadius: 3,
+                }}>{data.abilityCooldown}</div>
+              </div>
+              <div style={{ fontSize: 12.5, color: COLORS.ink, lineHeight: 1.5 }}>{data.abilityDesc}</div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
+  );
+}
+
+function PiezasTab() {
+  const [zoomPiece, setZoomPiece] = useState(null);
+  return (
+    <>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 16 }}>
+        {PIECE_ORDER.map(pt => <PieceCard key={pt} pieceType={pt} onZoom={setZoomPiece} />)}
+      </div>
+      {zoomPiece && <PieceZoomModal pieceType={zoomPiece} onClose={() => setZoomPiece(null)} />}
+    </>
   );
 }
 
@@ -817,51 +1178,166 @@ function PiezasTab() {
 
 function ReglasTab() {
   const Section = ({ title, children }) => (
-    <div style={{ marginBottom: 24 }}>
+    <div style={{ marginBottom: 22 }}>
       <h3 style={{
-        fontFamily: 'Cinzel, serif', fontSize: 18, fontWeight: 700,
+        fontFamily: 'Cinzel, serif', fontSize: 17, fontWeight: 700,
         color: COLORS.gold, letterSpacing: 2, marginBottom: 10,
         borderBottom: `1px solid ${COLORS.goldDeep}66`, paddingBottom: 6,
       }}>{title}</h3>
       {children}
     </div>
   );
-  const li = { fontSize: 14, color: COLORS.ink, lineHeight: 1.6, marginBottom: 6 };
+  const Sub = ({ title, children }) => (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{
+        fontFamily: 'Cinzel, serif', fontSize: 13, fontWeight: 600,
+        color: COLORS.ink, letterSpacing: 1.2, marginBottom: 4,
+      }}>{title}</div>
+      {children}
+    </div>
+  );
+  const li = { fontSize: 13.5, color: COLORS.ink, lineHeight: 1.55, marginBottom: 5 };
+  const p = { fontSize: 13.5, color: COLORS.ink, lineHeight: 1.55, marginBottom: 8 };
+  const tip = {
+    background: COLORS.cardLight, borderLeft: `3px solid ${COLORS.gold}`,
+    padding: '8px 12px', borderRadius: 4, marginBottom: 10,
+    fontSize: 12.5, color: COLORS.ink, lineHeight: 1.5,
+  };
   return (
     <div style={{
-      background: COLORS.card, borderRadius: 10, padding: 24,
+      background: COLORS.card, borderRadius: 10, padding: 22,
       border: `1px solid ${COLORS.goldDeep}66`,
     }}>
-      <Section title="OBJETIVO">
-        <p style={li}>Capturar al <strong style={{color: COLORS.gold}}>Monarca</strong> enemigo. Si tu Monarca cae, perdiste.</p>
+
+      <Section title="OBJETIVO DEL JUEGO">
+        <p style={p}>
+          El objetivo es <strong style={{color: COLORS.gold}}>capturar al Monarca enemigo</strong>.
+          Si tu Monarca cae, perdés la partida inmediatamente. No hay jaque ni jaque mate como en ajedrez:
+          la partida termina cuando un Monarca es capturado.
+        </p>
       </Section>
-      <Section title="TABLERO Y PIEZAS">
-        <ul style={{ paddingLeft: 18 }}>
-          <li style={li}>Tablero <strong>9×9</strong> (81 casillas).</li>
-          <li style={li}>Cada bando: 18 piezas — 1 Monarca, 1 Hechicera, 1 Caballero, 2 Fortalezas, 2 Jinetes, 2 Druidas, 9 Infantes.</li>
+
+      <Section title="EL TABLERO">
+        <ul style={{ paddingLeft: 18, marginTop: 0 }}>
+          <li style={li}>Tablero de <strong>9×9 casillas</strong> (81 en total).</li>
+          <li style={li}>Las columnas se numeran de <strong>a</strong> a <strong>i</strong> (izquierda a derecha) y las filas de <strong>1</strong> a <strong>9</strong> (abajo hacia arriba, desde la perspectiva del jugador Dorado).</li>
+          <li style={li}>El bando <strong style={{color: COLORS.gold}}>Dorado</strong> ocupa las dos filas inferiores; el <strong style={{color: COLORS.crimson}}>Carmesí</strong>, las dos superiores.</li>
         </ul>
       </Section>
-      <Section title="TURNOS">
-        <ul style={{ paddingLeft: 18 }}>
-          <li style={li}>Dorado mueve primero.</li>
-          <li style={li}>En tu turno: movés una pieza o activás una habilidad.</li>
-          <li style={li}>Excepción: Jinete con <em>Doble Galope</em> hace dos movimientos en el mismo turno.</li>
+
+      <Section title="DISTRIBUCIÓN INICIAL (18 piezas por bando)">
+        <ul style={{ paddingLeft: 18, marginTop: 0 }}>
+          <li style={li}>1 <strong>Monarca</strong> (centro de la fila de atrás).</li>
+          <li style={li}>1 <strong>Hechicera</strong> y 1 <strong>Caballero</strong> (junto al Monarca).</li>
+          <li style={li}>2 <strong>Fortalezas</strong> (esquinas).</li>
+          <li style={li}>2 <strong>Jinetes</strong> y 2 <strong>Druidas</strong> (resto de la fila trasera).</li>
+          <li style={li}>9 <strong>Infantes</strong> (toda la segunda fila).</li>
+        </ul>
+        <div style={tip}>
+          💡 Mirá la pestaña <strong>PIEZAS</strong> para ver el patrón de movimiento de cada una. Tocá una imagen para verla en grande.
+        </div>
+      </Section>
+
+      <Section title="CÓMO SE JUEGA">
+        <Sub title="Turnos">
+          <ul style={{ paddingLeft: 18, marginTop: 0 }}>
+            <li style={li}>El <strong style={{color: COLORS.gold}}>Dorado mueve primero</strong>. Después se alternan los turnos.</li>
+            <li style={li}>En tu turno hacés <strong>una sola acción</strong>: movés una pieza <em>o</em> activás una habilidad.</li>
+            <li style={li}>Excepción: el <em>Doble Galope</em> del Jinete permite hacer <strong>dos movimientos consecutivos</strong> en el mismo turno (podés saltar el segundo si querés).</li>
+          </ul>
+        </Sub>
+
+        <Sub title="Movimiento">
+          <ul style={{ paddingLeft: 18, marginTop: 0 }}>
+            <li style={li}>Tocá una de tus piezas para seleccionarla. Aparecen puntos verdes en las casillas a las que puede moverse.</li>
+            <li style={li}>Tocá una casilla resaltada para moverla. Si en esa casilla hay una pieza enemiga, se ve resaltada con un círculo rojo: la <strong>capturás</strong> al ir.</li>
+            <li style={li}>No podés saltar piezas (excepto el Jinete y el Caballero en su movimiento en L, que saltan).</li>
+            <li style={li}>No podés capturar piezas propias. No podés moverte a una casilla ocupada por un aliado.</li>
+            <li style={li}>Para deseleccionar, tocá la pieza otra vez o tocá fuera del tablero.</li>
+          </ul>
+        </Sub>
+
+        <Sub title="Captura">
+          <p style={p}>
+            Capturar una pieza enemiga es simplemente moverse a su casilla. La pieza capturada se va al área de capturas correspondiente.
+            La única forma de ganar es capturar al Monarca rival.
+          </p>
+        </Sub>
+
+        <Sub title="Promoción del Infante">
+          <p style={p}>
+            Si un Infante llega a la <strong>última fila enemiga</strong> (fila 9 para el Dorado, fila 1 para el Carmesí),
+            se transforma automáticamente en <strong>Hechicera</strong>. Esta promoción es gratuita: no usa habilidad y no consume turno extra.
+          </p>
+        </Sub>
+      </Section>
+
+      <Section title="HABILIDADES ESPECIALES">
+        <p style={p}>
+          Cada tipo de pieza tiene una habilidad única. Para usarla, seleccioná la pieza y tocá el botón ⚜ que aparece debajo del tablero.
+        </p>
+        <Sub title="Tipos de habilidad">
+          <ul style={{ paddingLeft: 18, marginTop: 0 }}>
+            <li style={li}><strong>Cooldown (recarga)</strong>: tras usarla, la habilidad queda inactiva durante una cantidad fija de turnos antes de poder usarse de nuevo (cada pieza individual tiene su propio contador).</li>
+            <li style={li}><strong>1 vez por partida</strong>: solo se puede usar <strong>una única vez</strong> en toda la partida. Aplica al Monarca (<em>Salto Real</em>) y al Infante (<em>Coronación Anticipada</em>).</li>
+          </ul>
+        </Sub>
+        <Sub title="Lista de habilidades">
+          <ul style={{ paddingLeft: 18, marginTop: 0 }}>
+            <li style={li}><strong>Salto Real</strong> (Monarca): salta 2 casillas en cruz pasando por encima de piezas. Útil para escapar de amenazas. <em>1 vez por partida</em>.</li>
+            <li style={li}><strong>Hechizo Letal</strong> (Hechicera): captura sin moverse cualquier pieza enemiga a hasta 3 casillas. <em>Cooldown: 6 turnos</em>.</li>
+            <li style={li}><strong>Aplastar</strong> (Fortaleza): captura sin moverse una pieza enemiga adyacente. <em>Cooldown: 5 turnos</em>.</li>
+            <li style={li}><strong>Brote</strong> (Druida): invoca un Infante aliado nuevo en una casilla vacía adyacente. <em>Cooldown: 8 turnos</em>.</li>
+            <li style={li}><strong>Doble Galope</strong> (Jinete): permite hacer 2 movimientos seguidos en el mismo turno. Bloqueado en Jinetes recién creados o promocionados (deben esperar al menos 2 turnos). <em>Cooldown: 8 turnos</em>.</li>
+            <li style={li}><strong>Embestida</strong> (Caballero): este turno se mueve hasta 4 casillas en cualquier dirección (puede capturar al final). <em>Cooldown: 5 turnos</em>.</li>
+            <li style={li}><strong>Coronación Anticipada</strong> (Infante): se transforma en cualquier pieza (excepto Monarca) sin moverse. <strong>Solo disponible en la mitad enemiga del tablero</strong> (filas 1-4 para el Carmesí; filas 5-8 para el Dorado, según donde esté tu Infante). <em>1 vez por partida</em>.</li>
+          </ul>
+        </Sub>
+        <div style={tip}>
+          ⚠️ Si la habilidad está en cooldown o ya fue usada, el botón aparece desactivado. Las habilidades NO cuentan como "movimiento" salvo en los casos donde la pieza también se desplaza (Salto Real, Embestida, Doble Galope).
+        </div>
+      </Section>
+
+      <Section title="CONTROLES E INTERFAZ">
+        <ul style={{ paddingLeft: 18, marginTop: 0 }}>
+          <li style={li}><strong>Tocar una pieza propia</strong>: la selecciona y muestra los movimientos disponibles.</li>
+          <li style={li}><strong>Tocar una casilla resaltada en verde</strong>: mueve la pieza ahí.</li>
+          <li style={li}><strong>Tocar una pieza enemiga resaltada en rojo</strong>: la captura.</li>
+          <li style={li}><strong>Botón ⚜ debajo del tablero</strong>: activa la habilidad de la pieza seleccionada (si está disponible).</li>
+          <li style={li}><strong>REINICIAR</strong>: empieza una partida nueva.</li>
+          <li style={li}>El <strong>Registro</strong> muestra el historial reciente de jugadas en notación abreviada.</li>
         </ul>
       </Section>
-      <Section title="DIFICULTAD E IA">
-        <ul style={{ paddingLeft: 18 }}>
-          <li style={li}><strong>Muy fácil / Fácil</strong>: la IA no usa habilidades. Ideal para aprender.</li>
-          <li style={li}><strong>Normal</strong>: usa Aplastar, Hechizo Letal y Embestida cuando le conviene.</li>
-          <li style={li}><strong>Difícil / Experto / Invencible</strong>: usa TODAS las habilidades — incluyendo Salto Real defensivo, Coronación, Brote y Doble Galope.</li>
+
+      <Section title="DIFICULTAD DE LA IA">
+        <ul style={{ paddingLeft: 18, marginTop: 0 }}>
+          <li style={li}><strong>Muy fácil</strong>: IA aleatoria, sin habilidades. Para aprender los movimientos.</li>
+          <li style={li}><strong>Fácil</strong>: empieza a buscar capturas. Sin habilidades aún.</li>
+          <li style={li}><strong>Normal</strong>: busca 2 jugadas adelante. Usa Aplastar, Hechizo Letal y Embestida.</li>
+          <li style={li}><strong>Difícil</strong>: busca 3 jugadas adelante con evaluación posicional. Usa TODAS las habilidades. Pensá tus jugadas.</li>
+          <li style={li}><strong>Experto</strong>: 3 niveles de profundidad con análisis de amenazas y defensas. Es muy difícil de derrotar.</li>
+          <li style={li}><strong>Invencible</strong>: 4 niveles de profundidad, evaluación completísima con seguridad del Monarca y control del tablero. Solo los mejores podrán vencerla.</li>
         </ul>
       </Section>
-      <Section title="HABILIDADES">
-        <ul style={{ paddingLeft: 18 }}>
-          <li style={li}><strong>1 vez por partida</strong>: Monarca (Salto Real) e Infante (Coronación).</li>
-          <li style={li}><strong>Cooldown</strong>: las demás. Después de usarse quedan inactivas X turnos.</li>
-          <li style={li}>Cada habilidad tiene su propio sonido distintivo. La captura del Monarca tiene su propia secuencia dramática.</li>
+
+      <Section title="OPCIONES DE SONIDO">
+        <ul style={{ paddingLeft: 18, marginTop: 0 }}>
+          <li style={li}><strong>Música ambiente</strong>: una melodía suave y atmosférica que acompaña la partida. Podés activarla o desactivarla desde el menú JUGAR.</li>
+          <li style={li}><strong>Efectos de sonido</strong>: los sonidos de las piezas al moverse, capturar o usar habilidades. También se pueden desactivar.</li>
+          <li style={li}>Las preferencias se guardan automáticamente para la próxima vez que entres.</li>
         </ul>
       </Section>
+
+      <Section title="CONSEJOS BÁSICOS">
+        <ul style={{ paddingLeft: 18, marginTop: 0 }}>
+          <li style={li}>Protegé a tu Monarca: mantenelo lejos del centro temprano y rodeado de aliados.</li>
+          <li style={li}>Los Infantes promocionados se vuelven Hechiceras: aprovechalo empujándolos.</li>
+          <li style={li}>Las habilidades de 1 vez por partida son tu carta del triunfo: guardalas para momentos críticos.</li>
+          <li style={li}>El control del centro del tablero te da más movilidad y opciones de ataque.</li>
+          <li style={li}>Hechizo Letal y Aplastar son devastadores porque no requieren mover la pieza.</li>
+        </ul>
+      </Section>
+
     </div>
   );
 }
@@ -870,6 +1346,53 @@ function ReglasTab() {
 
 const ANIM_MS = 450;
 let pieceIdCounter = 100;
+
+function SoundToggleRow({ label, description, icon, checked, onChange }) {
+  return (
+    <label style={{
+      display: 'flex', alignItems: 'center', gap: 10,
+      cursor: 'pointer', userSelect: 'none',
+      padding: '6px 4px',
+    }}>
+      <div style={{
+        fontSize: 18, lineHeight: 1, width: 22, textAlign: 'center',
+      }}>{icon}</div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{
+          fontFamily: 'Cinzel, serif', fontSize: 12.5, fontWeight: 600,
+          color: COLORS.ink, letterSpacing: 0.6,
+        }}>{label}</div>
+        <div style={{
+          fontSize: 10.5, color: COLORS.inkMute, lineHeight: 1.3,
+        }}>{description}</div>
+      </div>
+      <button
+        type="button"
+        onClick={(e) => { e.preventDefault(); onChange(!checked); }}
+        role="switch"
+        aria-checked={checked}
+        aria-label={label}
+        style={{
+          flexShrink: 0,
+          width: 44, height: 24, borderRadius: 12,
+          background: checked ? COLORS.gold : '#3A3A3A',
+          border: `1px solid ${checked ? COLORS.gold : COLORS.inkMute}`,
+          position: 'relative', cursor: 'pointer',
+          transition: 'background 0.2s',
+          padding: 0,
+        }}>
+        <div style={{
+          position: 'absolute',
+          top: 2, left: checked ? 22 : 2,
+          width: 18, height: 18, borderRadius: '50%',
+          background: '#FFF',
+          transition: 'left 0.2s',
+          boxShadow: '0 1px 3px rgba(0,0,0,0.4)',
+        }}/>
+      </button>
+    </label>
+  );
+}
 
 function JugarTab({ multiplayer = null }) {
   // === MULTIPLAYER CONTEXT ===
@@ -907,6 +1430,16 @@ function JugarTab({ multiplayer = null }) {
   const [scenario, setScenario] = useState('clasico');
   const [cellSize, setCellSize] = useState(40);
   const [turnNumber, setTurnNumber] = useState(0);
+  const [sfxOn, setSfxOn] = useState(soundConfig.effects);
+  const [ambientOn, setAmbientOn] = useState(soundConfig.ambient);
+
+  // Iniciar/parar música ambiente cuando cambia el toggle
+  useEffect(() => {
+    setAmbient(ambientOn);
+  }, [ambientOn]);
+  useEffect(() => {
+    setEffects(sfxOn);
+  }, [sfxOn]);
 
   const piecesRef = useRef(pieces);
   const cooldownsRef = useRef(cooldowns);
@@ -1176,14 +1709,59 @@ function JugarTab({ multiplayer = null }) {
       setAiThinking(false);
 
       // Decide: ability or regular?
-      // Use ability if it captures significantly more value than the best regular capture
+      const cfg = DIFFICULTY_LEVELS[difficulty];
       let regularCaptureValue = 0;
       if (regularMove && curBoard[regularMove.to[0]][regularMove.to[1]]) {
         regularCaptureValue = PIECE_DATA[curBoard[regularMove.to[0]][regularMove.to[1]].type].value;
       }
 
-      // Use ability if its score > regular capture value (or ability is special like Salto Real)
-      if (abilityMove && (abilityMove.score > regularCaptureValue || abilityMove.abilityType === 'monarca')) {
+      // En experto/invencible: simular el resultado de la habilidad y comparar evaluación global
+      // En lugar de comparar valores crudos.
+      let useAbility = false;
+      if (abilityMove) {
+        if (cfg.advanced) {
+          // Simulación: aplicar la habilidad y evaluar el tablero
+          let simBoard = curBoard.map(row => row.slice());
+          if (abilityMove.abilityType === 'fortaleza' || abilityMove.abilityType === 'hechicera') {
+            // captura sin moverse
+            simBoard[abilityMove.target[0]][abilityMove.target[1]] = null;
+          } else if (abilityMove.abilityType === 'caballero' || abilityMove.abilityType === 'monarca') {
+            // movimiento extendido
+            simBoard = applyMoveSim(curBoard, abilityMove.from, abilityMove.target);
+          } else if (abilityMove.abilityType === 'druida') {
+            // spawn de infante
+            simBoard[abilityMove.target[0]][abilityMove.target[1]] = {
+              type: 'infante', color: 'crimson', row: abilityMove.target[0], col: abilityMove.target[1]
+            };
+          } else if (abilityMove.abilityType === 'infante') {
+            // coronación
+            const inf = simBoard[abilityMove.from[0]][abilityMove.from[1]];
+            if (inf) {
+              simBoard[abilityMove.from[0]][abilityMove.from[1]] = { ...inf, type: abilityMove.newType || 'caballero' };
+            }
+          } else if (abilityMove.abilityType === 'jinete') {
+            simBoard = applyMoveSim(curBoard, abilityMove.from, abilityMove.target);
+          }
+          const evalAfterAbility = evalBoard(simBoard, 'crimson', {
+            positional: cfg.positional, threatEval: cfg.threatEval,
+            kingSafety: cfg.kingSafety, advanced: cfg.advanced
+          });
+          // Movimiento regular: usar score del minimax (no se recalcula aquí pero approximamos)
+          let simBoardReg = curBoard;
+          if (regularMove) simBoardReg = applyMoveSim(curBoard, regularMove.from, regularMove.to);
+          const evalAfterRegular = evalBoard(simBoardReg, 'crimson', {
+            positional: cfg.positional, threatEval: cfg.threatEval,
+            kingSafety: cfg.kingSafety, advanced: cfg.advanced
+          });
+          useAbility = evalAfterAbility > evalAfterRegular + 0.3;
+          // Forzar habilidad defensiva del monarca si está bajo amenaza
+          if (abilityMove.abilityType === 'monarca' && abilityMove.score >= 100) useAbility = true;
+        } else {
+          useAbility = (abilityMove.score > regularCaptureValue) || abilityMove.abilityType === 'monarca';
+        }
+      }
+
+      if (useAbility) {
         executeAIAbility(abilityMove);
       } else if (regularMove) {
         executeMove(regularMove.pieceId, regularMove.to[0], regularMove.to[1]);
@@ -1680,6 +2258,36 @@ function JugarTab({ multiplayer = null }) {
         </div>
       </div>
 
+      {/* Sonido toggles */}
+      <div style={{
+        background: COLORS.card, borderRadius: 10, padding: '10px 12px',
+        border: `1px solid ${COLORS.goldDeep}66`,
+      }}>
+        <div style={{
+          fontSize: 10, letterSpacing: 1.5, color: COLORS.gold,
+          fontFamily: 'Cinzel, serif', fontWeight: 600, marginBottom: 8,
+        }}>SONIDO</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <SoundToggleRow
+            label="Música ambiente"
+            description="Melodía suave de fondo durante la partida"
+            icon="🎵"
+            checked={ambientOn}
+            onChange={async (v) => {
+              await ensureAudio();
+              setAmbientOn(v);
+            }}
+          />
+          <SoundToggleRow
+            label="Sonidos de piezas"
+            description="Movimientos, capturas y habilidades"
+            icon="⚔️"
+            checked={sfxOn}
+            onChange={(v) => setSfxOn(v)}
+          />
+        </div>
+      </div>
+
       {/* Status */}
       <div style={{
         background: COLORS.card, borderRadius: 10, padding: '10px 14px',
@@ -1983,7 +2591,7 @@ function Realeza() {
           <div style={{
             fontFamily: 'Cinzel, serif', fontSize: 11, letterSpacing: 4,
             color: COLORS.gold, marginBottom: 2,
-          }}>UN JUEGO DE 9×9 — V3</div>
+          }}>UN JUEGO DE 9×9</div>
           <h1 style={{
             fontFamily: 'Cinzel, serif', fontSize: 40, fontWeight: 700,
             letterSpacing: 8, color: COLORS.ink, margin: 0,
@@ -2005,7 +2613,7 @@ function Realeza() {
           borderTop: `1px solid ${COLORS.goldDeep}33`,
           textAlign: 'center', fontSize: 10, color: COLORS.inkMute, letterSpacing: 1,
         }}>
-          REALEZA · V3 — IA CON HABILIDADES · SONIDOS POR PIEZA Y HABILIDAD
+          REALEZA · IA AVANZADA · MÚSICA AMBIENTE · ZOOM DE PIEZAS
         </footer>
       </div>
     </div>
