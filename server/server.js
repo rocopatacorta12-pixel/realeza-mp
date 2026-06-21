@@ -112,23 +112,27 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Crear partida: el que invitó (opp) es gold, el que aceptó (me) es crimson
+    // Crear partida: asignación ALEATORIA de colores (50/50 entre invitador y aceptador)
     const gameId = `g${gameCounter++}`;
+    const oppIsGold = Math.random() < 0.5;
+    const goldPlayer    = oppIsGold ? opp : me;
+    const crimsonPlayer = oppIsGold ? me  : opp;
+
     games.set(gameId, {
-      goldSocket: opp.socketId,
-      crimsonSocket: me.socketId,
+      goldSocket: goldPlayer.socketId,
+      crimsonSocket: crimsonPlayer.socketId,
       startedAt: Date.now(),
     });
     me.status = 'in-game'; me.gameId = gameId; me.opponentId = opp.socketId;
     opp.status = 'in-game'; opp.gameId = gameId; opp.opponentId = me.socketId;
 
-    io.to(opp.socketId).emit('game_start', {
-      gameId, color: 'gold', opponentName: me.name,
+    io.to(goldPlayer.socketId).emit('game_start', {
+      gameId, color: 'gold', opponentName: crimsonPlayer.name,
     });
-    io.to(me.socketId).emit('game_start', {
-      gameId, color: 'crimson', opponentName: opp.name,
+    io.to(crimsonPlayer.socketId).emit('game_start', {
+      gameId, color: 'crimson', opponentName: goldPlayer.name,
     });
-    console.log(`[game_start] ${gameId}: ${opp.name}(gold) vs ${me.name}(crimson)`);
+    console.log(`[game_start] ${gameId}: ${goldPlayer.name}(gold) vs ${crimsonPlayer.name}(crimson) — random assignment`);
     broadcastPlayerList();
   });
 

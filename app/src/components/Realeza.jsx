@@ -878,6 +878,13 @@ function JugarTab({ multiplayer = null }) {
   const applyingRemoteRef = useRef(0); // contador: > 0 cuando se está aplicando una acción del rival
   const isLocalTurn = (color) => color === myColor;
 
+  // === VISTA: tablero volteado para el jugador Carmesí en multiplayer ===
+  // Esto sólo cambia el RENDER. Coordenadas lógicas (board, pieces, moves, red, IA) intactas.
+  // Así cada jugador ve sus piezas siempre abajo (estilo Clash Royale).
+  const flipped = !!multiplayer && myColor === 'crimson';
+  const flipR = (r) => flipped ? (BOARD_SIZE - 1 - r) : r;
+  const flipC = (c) => flipped ? (BOARD_SIZE - 1 - c) : c;
+
   const [pieces, setPieces] = useState(createInitialPieces);
   const [turn, setTurn] = useState('gold');
   const [selectedId, setSelectedId] = useState(null);
@@ -1762,7 +1769,9 @@ function JugarTab({ multiplayer = null }) {
               position: 'absolute', inset: 0,
             }}>
               {Array.from({length: BOARD_SIZE*BOARD_SIZE}, (_, i) => {
-                const r = Math.floor(i / BOARD_SIZE), c = i % BOARD_SIZE;
+                // dr,dc = posición VISUAL en el grid; r,c = posición LÓGICA en el board
+                const dr = Math.floor(i / BOARD_SIZE), dc = i % BOARD_SIZE;
+                const r = flipR(dr), c = flipC(dc);
                 const dark = (r+c) % 2 === 1;
                 const isHL = highlights.some(([nr,nc]) => nr===r && nc===c);
                 const isAbT = abilityTargets.some(([nr,nc]) => nr===r && nc===c);
@@ -1802,7 +1811,7 @@ function JugarTab({ multiplayer = null }) {
             {visiblePieces.map(p => (
               <div key={p.id} style={{
                 position: 'absolute',
-                top: p.row * cellSize, left: p.col * cellSize,
+                top: flipR(p.row) * cellSize, left: flipC(p.col) * cellSize,
                 width: cellSize, height: cellSize,
                 transition: `top ${ANIM_MS}ms cubic-bezier(0.4, 0.0, 0.2, 1), left ${ANIM_MS}ms cubic-bezier(0.4, 0.0, 0.2, 1)`,
                 pointerEvents: 'none',
