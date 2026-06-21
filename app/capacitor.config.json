@@ -1,0 +1,14 @@
+{
+  "appId": "com.rafa.realeza",
+  "appName": "Realeza",
+  "webDir": "dist",
+  "android": {
+    "allowMixedContent": true,
+    "captureInput": true,
+    "webContentsDebuggingEnabled": false
+  },
+  "server": {
+    "androidScheme": "https",
+    "cleartext": true
+  }
+}
