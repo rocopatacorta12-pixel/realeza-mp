@@ -597,6 +597,7 @@ async function ensureAudio() {
 let ambientSynth = null;
 let ambientPad = null;
 let ambientReverb = null;
+let ambientChorus = null;
 let ambientInterval = null;
 
 function startAmbient() {
@@ -604,21 +605,27 @@ function startAmbient() {
   if (ambientInterval) return; // ya está sonando
   try {
     if (!ambientReverb) {
-      ambientReverb = new Tone.Reverb({ decay: 6, wet: 0.5 }).toDestination();
+      ambientReverb = new Tone.Reverb({ decay: 7, wet: 0.35 }).toDestination();
+    }
+    if (!ambientChorus) {
+      // Chorus suave: engorda el pad y le da movimiento tipo "respiración"
+      ambientChorus = new Tone.Chorus({ frequency: 0.4, delayTime: 4, depth: 0.7, wet: 0.5 })
+        .connect(ambientReverb)
+        .start();
     }
     if (!ambientPad) {
       ambientPad = new Tone.PolySynth(Tone.Synth, {
         oscillator: { type: 'sine' },
         envelope: { attack: 2.0, decay: 1.0, sustain: 0.7, release: 4.0 },
-      }).connect(ambientReverb);
-      ambientPad.volume.value = -28;
+      }).connect(ambientChorus);
+      ambientPad.volume.value = -8;
     }
     if (!ambientSynth) {
       ambientSynth = new Tone.PolySynth(Tone.Synth, {
         oscillator: { type: 'triangle' },
         envelope: { attack: 1.5, decay: 0.8, sustain: 0.5, release: 3.0 },
-      }).connect(ambientReverb);
-      ambientSynth.volume.value = -32;
+      }).connect(ambientChorus);
+      ambientSynth.volume.value = -14;
     }
 
     // Progresión simple en Re menor: ambiente medieval/regal suave
@@ -632,13 +639,13 @@ function startAmbient() {
     const playChord = () => {
       if (!soundConfig.ambient || !ambientPad) return;
       try {
-        ambientPad.triggerAttackRelease(progression[idx], '2n', undefined, 0.3);
+        ambientPad.triggerAttackRelease(progression[idx], '2n', undefined, 0.7);
         // Melodía superior suave ocasional
         if (idx % 2 === 0) {
           const melody = progression[idx][2]; // nota superior
           setTimeout(() => {
             if (soundConfig.ambient && ambientSynth) {
-              try { ambientSynth.triggerAttackRelease(melody, '4n', undefined, 0.25); } catch (_) {}
+              try { ambientSynth.triggerAttackRelease(melody, '4n', undefined, 0.55); } catch (_) {}
             }
           }, 800);
         }
