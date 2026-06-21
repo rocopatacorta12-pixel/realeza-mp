@@ -612,7 +612,7 @@ function startAmbient() {
   if (ambientInterval) return; // ya está sonando
   try {
     if (!ambientReverb) {
-      ambientReverb = new Tone.Reverb({ decay: 7, wet: 0.35 }).toDestination();
+      ambientReverb = new Tone.Reverb({ decay: 8, wet: 0.45 }).toDestination();
     }
     if (!ambientChorus) {
       // Chorus suave: engorda el pad y le da movimiento tipo "respiración"
@@ -625,14 +625,16 @@ function startAmbient() {
         oscillator: { type: 'sine' },
         envelope: { attack: 2.0, decay: 1.0, sustain: 0.7, release: 4.0 },
       }).connect(ambientChorus);
-      ambientPad.volume.value = -8;
+      // Volumen subido: -8 → 0 dB (mucho más presente, ahora se escucha bien)
+      ambientPad.volume.value = 0;
     }
     if (!ambientSynth) {
       ambientSynth = new Tone.PolySynth(Tone.Synth, {
         oscillator: { type: 'triangle' },
         envelope: { attack: 1.5, decay: 0.8, sustain: 0.5, release: 3.0 },
       }).connect(ambientChorus);
-      ambientSynth.volume.value = -14;
+      // Volumen subido: -14 → -6 dB (melodía superior más audible)
+      ambientSynth.volume.value = -6;
     }
 
     // Progresión simple en Re menor: ambiente medieval/regal suave
@@ -646,13 +648,15 @@ function startAmbient() {
     const playChord = () => {
       if (!soundConfig.ambient || !ambientPad) return;
       try {
-        ambientPad.triggerAttackRelease(progression[idx], '2n', undefined, 0.7);
+        // Velocity subida: 0.7 → 0.9 (pad más presente)
+        ambientPad.triggerAttackRelease(progression[idx], '2n', undefined, 0.9);
         // Melodía superior suave ocasional
         if (idx % 2 === 0) {
           const melody = progression[idx][2]; // nota superior
           setTimeout(() => {
             if (soundConfig.ambient && ambientSynth) {
-              try { ambientSynth.triggerAttackRelease(melody, '4n', undefined, 0.55); } catch (_) {}
+              // Velocity subida: 0.55 → 0.75
+              try { ambientSynth.triggerAttackRelease(melody, '4n', undefined, 0.75); } catch (_) {}
             }
           }, 800);
         }
@@ -1048,6 +1052,10 @@ function PieceCard({ pieceType, onZoom }) {
         background: COLORS.cardLight, borderLeft: `3px solid ${COLORS.gold}`,
         padding: '10px 12px', borderRadius: 4,
       }}>
+        <div style={{
+          fontSize: 10, letterSpacing: 1.5, color: COLORS.gold,
+          fontFamily: 'Cinzel, serif', fontWeight: 600, marginBottom: 6,
+        }}>HABILIDAD ESPECIAL</div>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4, flexWrap: 'wrap', gap: 6 }}>
           <div style={{
             fontFamily: 'Cinzel, serif', fontSize: 14, fontWeight: 600,
@@ -1157,6 +1165,10 @@ function PieceZoomModal({ pieceType, onClose }) {
               background: COLORS.bg, borderLeft: `3px solid ${COLORS.gold}`,
               padding: '10px 14px', borderRadius: 4,
             }}>
+              <div style={{
+                fontSize: 10, letterSpacing: 1.5, color: COLORS.gold,
+                fontFamily: 'Cinzel, serif', fontWeight: 600, marginBottom: 6,
+              }}>HABILIDAD ESPECIAL</div>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4, flexWrap: 'wrap', gap: 6 }}>
                 <div style={{
                   fontFamily: 'Cinzel, serif', fontSize: 14, fontWeight: 600,
@@ -1954,7 +1966,8 @@ function JugarTab({ multiplayer = null }) {
         const nr = r+dr*2, nc = c+dc*2;
         if (inBounds(nr,nc)) {
           const tgt = board[nr][nc];
-          if (!tgt || tgt.color !== 'gold') targets.push([nr,nc]);
+          // FIX: usar myColor (no 'gold' hardcodeado) para no bloquear al jugador Carmesí
+          if (!tgt || tgt.color !== myColor) targets.push([nr,nc]);
         }
       }
       if (targets.length === 0) return;
@@ -1964,7 +1977,8 @@ function JugarTab({ multiplayer = null }) {
       for (let dr=-3; dr<=3; dr++) for (let dc=-3; dc<=3; dc++) {
         if (dr===0 && dc===0) continue;
         const nr = r+dr, nc = c+dc;
-        if (inBounds(nr,nc) && board[nr][nc] && board[nr][nc].color === 'crimson') {
+        // FIX: apuntar a piezas del oponente (oppColor), no a 'crimson' fijo
+        if (inBounds(nr,nc) && board[nr][nc] && board[nr][nc].color === oppColor) {
           targets.push([nr,nc]);
         }
       }
@@ -1974,7 +1988,8 @@ function JugarTab({ multiplayer = null }) {
       const targets = [];
       for (const [dr,dc] of DIR8) {
         const nr = r+dr, nc = c+dc;
-        if (inBounds(nr,nc) && board[nr][nc] && board[nr][nc].color === 'crimson') {
+        // FIX: apuntar a piezas del oponente (oppColor), no a 'crimson' fijo
+        if (inBounds(nr,nc) && board[nr][nc] && board[nr][nc].color === oppColor) {
           targets.push([nr,nc]);
         }
       }
@@ -1995,7 +2010,8 @@ function JugarTab({ multiplayer = null }) {
           const nr = r+dr*i, nc = c+dc*i;
           if (!inBounds(nr,nc)) break;
           if (board[nr][nc]) {
-            if (board[nr][nc].color !== 'gold') targets.push([nr,nc]);
+            // FIX: usar myColor (no 'gold' hardcodeado) para no bloquear al jugador Carmesí
+            if (board[nr][nc].color !== myColor) targets.push([nr,nc]);
             break;
           }
           targets.push([nr,nc]);
@@ -2037,9 +2053,10 @@ function JugarTab({ multiplayer = null }) {
       setOncePerGame(prev => ({ ...prev, [myColor]: { ...prev[myColor], monarca: true }}));
       executeMove(piece.id, tr, tc, true, 'Salto Real');
     } else if (type === 'hechicera') {
-      playAbility('hechicera');
       const targetP = piecesRef.current.find(p => !p.captured && p.row === tr && p.col === tc);
-      if (!targetP) return;
+      // SAFETY: no permitir auto-captura (defensa contra bug de targeting)
+      if (!targetP || targetP.color === myColor) return;
+      playAbility('hechicera');
       sendIfLocal({ kind: 'spell', abilityKey: 'hechicera', attackerId: piece.id, victimId: targetP.id, cooldownVal: 7, abilityLabel: 'Hechizo Letal' });
       setAnimating(true);
       const newPieces = piecesRef.current.map(p =>
@@ -2059,9 +2076,10 @@ function JugarTab({ multiplayer = null }) {
       }, ANIM_MS);
       setSelectedId(null); setHighlights([]); setAbilityTargets([]); setActiveAbility(null);
     } else if (type === 'fortaleza') {
-      playAbility('fortaleza');
       const targetP = piecesRef.current.find(p => !p.captured && p.row === tr && p.col === tc);
-      if (!targetP) return;
+      // SAFETY: no permitir auto-captura (defensa contra bug de targeting)
+      if (!targetP || targetP.color === myColor) return;
+      playAbility('fortaleza');
       sendIfLocal({ kind: 'spell', abilityKey: 'fortaleza', attackerId: piece.id, victimId: targetP.id, cooldownVal: 6, abilityLabel: 'Aplastar' });
       setAnimating(true);
       const newPieces = piecesRef.current.map(p =>
@@ -2509,6 +2527,14 @@ function JugarTab({ multiplayer = null }) {
                 {PIECE_DATA[selectedPiece.type].movement}
               </div>
             </div>
+          </div>
+          {/* Header sección habilidad especial */}
+          <div style={{
+            fontFamily: 'Cinzel, serif', fontSize: 10, letterSpacing: 2,
+            color: COLORS.gold, marginTop: 4, marginBottom: 6,
+            borderTop: `1px solid ${COLORS.goldDeep}44`, paddingTop: 8,
+          }}>
+            HABILIDAD ESPECIAL
           </div>
           <button
             onClick={activateAbility}
