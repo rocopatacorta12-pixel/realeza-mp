@@ -579,18 +579,25 @@ function setEffects(on) {
 function setAmbient(on) {
   soundConfig.ambient = on;
   setStoredBool('realeza_ambient', on);
-  if (on) startAmbient();
-  else stopAmbient();
+  if (on) {
+    // ensureAudio inicia el audio context (si hace falta) y luego llama startAmbient.
+    // Como esto se dispara desde un toggle del usuario, el "user gesture" es válido.
+    ensureAudio();
+  } else {
+    stopAmbient();
+  }
 }
 
 async function ensureAudio() {
-  if (audioStarted) return;
-  try {
-    await Tone.start();
-    audioStarted = true;
-    if (!synths) initSynths();
-    if (soundConfig.ambient) startAmbient();
-  } catch (e) { console.warn(e); }
+  if (!audioStarted) {
+    try {
+      await Tone.start();
+      audioStarted = true;
+      if (!synths) initSynths();
+    } catch (e) { console.warn(e); return; }
+  }
+  // Siempre intentar arrancar ambient si está habilitado (idempotente)
+  if (soundConfig.ambient) startAmbient();
 }
 
 // === Música ambiente: acordes suaves, etéreos, en loop ===
@@ -1405,7 +1412,6 @@ function JugarTab({ multiplayer = null }) {
   // === MULTIPLAYER CONTEXT ===
   const myColor = multiplayer ? multiplayer.game.color : 'gold';
   const oppColor = myColor === 'gold' ? 'crimson' : 'gold';
-  const applyingRemoteRef = useRef(0); // contador: > 0 cuando se está aplicando una acción del rival
   const isLocalTurn = (color) => color === myColor;
 
   // === VISTA: tablero volteado para el jugador Carmesí en multiplayer ===
@@ -1452,22 +1458,44 @@ function JugarTab({ multiplayer = null }) {
   const cooldownsRef = useRef(cooldowns);
   const oncePerGameRef = useRef(oncePerGame);
   const turnNumberRef = useRef(turnNumber);
+  const turnRef = useRef(turn);
   useEffect(() => { piecesRef.current = pieces; }, [pieces]);
   useEffect(() => { cooldownsRef.current = cooldowns; }, [cooldowns]);
   useEffect(() => { oncePerGameRef.current = oncePerGame; }, [oncePerGame]);
   useEffect(() => { turnNumberRef.current = turnNumber; }, [turnNumber]);
+  useEffect(() => { turnRef.current = turn; }, [turn]);
+
+  // === AUDIO: pausar/reanudar al minimizar la app ===
+  // Evita que el reverb del ambient siga colgado distorsionado en background,
+  // y que sonidos del juego suenen mal al volver.
+  useEffect(() => {
+    function onVisibilityChange() {
+      try {
+        if (!Tone || !Tone.context) return;
+        if (document.visibilityState === 'hidden') {
+          Tone.context.suspend();
+        } else if (document.visibilityState === 'visible') {
+          Tone.context.resume();
+        }
+      } catch (_) {}
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, []);
 
   // === MULTIPLAYER: envío y recepción de acciones ===
+  // Modelo nuevo (sin candado por tiempo):
+  //  - sendIfLocal solo envía cuando es MI turno (turnRef === myColor).
+  //    Esto evita reenviar acciones que llegaron del rival (durante su turno).
+  //  - Cada mensaje lleva un sello "_tn" (número de turno). El receptor descarta
+  //    mensajes cuyo _tn no coincide con su turnNumber actual (duplicados,
+  //    fuera de orden, o desincronizados — ej. tras minimizar la app).
   function sendIfLocal(action) {
     if (!multiplayer) return;
-    if (applyingRemoteRef.current > 0) return; // estoy aplicando una acción remota, no reenviar
-    try { multiplayer.sendMove(action); } catch (_) {}
-  }
-
-  function beginRemote() {
-    applyingRemoteRef.current++;
-    // libera tras la animación + un colchón
-    setTimeout(() => { applyingRemoteRef.current = Math.max(0, applyingRemoteRef.current - 1); }, ANIM_MS + 1200);
+    if (turnRef.current !== myColor) return; // no es mi turno → no envío (evita loop con remoto)
+    try {
+      multiplayer.sendMove({ ...action, _tn: turnNumberRef.current });
+    } catch (_) {}
   }
 
   const board = useMemo(() => computeBoard(pieces), [pieces]);
@@ -1519,8 +1547,14 @@ function JugarTab({ multiplayer = null }) {
   function endTurn(justMovedColor) {
     decrementCooldowns(justMovedColor);
     setActiveAbility(null);
+    const nextTurn = justMovedColor === 'gold' ? 'crimson' : 'gold';
     setTurnNumber(prev => prev + 1);
-    setTurn(justMovedColor === 'gold' ? 'crimson' : 'gold');
+    setTurn(nextTurn);
+    // Mantener refs sincronizados de inmediato (sin esperar al re-render)
+    // así sendIfLocal y validaciones de turnNumber funcionan correctamente
+    // dentro del mismo tick.
+    turnRef.current = nextTurn;
+    turnNumberRef.current = (turnNumberRef.current || 0) + 1;
   }
 
   function executeMove(pieceId, toRow, toCol, isAbility = false, abilityLabel = null) {
@@ -2085,7 +2119,23 @@ function JugarTab({ multiplayer = null }) {
   // === MULTIPLAYER: aplicar acciones recibidas del rival ===
   function applyRemoteAction(action) {
     if (!action || !action.kind) return;
-    beginRemote();
+
+    // === VALIDACIONES ANTI-DESYNC ===
+    // 1) El sello de turno debe coincidir con nuestro turnNumber actual.
+    //    Si no coincide, es un mensaje duplicado, viejo, o llegó tras una
+    //    desincronización (ej: la app estuvo minimizada). Lo descartamos.
+    if (typeof action._tn === 'number' && action._tn !== turnNumberRef.current) {
+      // eslint-disable-next-line no-console
+      console.warn('[mp] descartado por turn mismatch', action._tn, '!=', turnNumberRef.current, action.kind);
+      return;
+    }
+    // 2) Solo aceptamos acciones del rival cuando es SU turno.
+    //    Si por algún motivo es nuestro turno, no aplicamos.
+    if (turnRef.current === myColor) {
+      // eslint-disable-next-line no-console
+      console.warn('[mp] descartado: no es turno del rival', action.kind);
+      return;
+    }
 
     switch (action.kind) {
       case 'move': {
@@ -2116,7 +2166,11 @@ function JugarTab({ multiplayer = null }) {
         // Hechizo Letal / Aplastar — captura sin moverse
         const attacker = piecesRef.current.find(p => p.id === action.attackerId);
         const victim = piecesRef.current.find(p => p.id === action.victimId);
-        if (!attacker || !victim) { applyingRemoteRef.current = Math.max(0, applyingRemoteRef.current - 1); return; }
+        if (!attacker || !victim) {
+          // eslint-disable-next-line no-console
+          console.warn('[mp] spell descartado: pieza no encontrada', action);
+          return;
+        }
         playAbility(attacker.type);
         setAnimating(true);
         const newPieces = piecesRef.current.map(p =>
