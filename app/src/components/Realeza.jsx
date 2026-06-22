@@ -1609,13 +1609,33 @@ function JugarTab({ multiplayer = null }) {
         return;
       }
       // Pending Jinete (after first move of doble galope)
-      if (pendingJinete && pendingJinete.pieceId === pieceId && pendingJinete.phase === 'first') {
+      // FIX desync multiplayer del 2° galope:
+      // Antes leíamos el state `pendingJinete` dentro de este setTimeout, pero el
+      // closure se queda con el valor del render donde se programó el timer.
+      // En el lado del rival, applyRemoteAction hace setPendingJinete({phase:'first'})
+      // y JUSTO DESPUÉS llama executeMove en el mismo handler — sin re-render entre
+      // medio. Entonces el closure veía pendingJinete = null, no entraba al if, y
+      // ejecutaba endTurn(piece.color) automáticamente terminando el turno antes
+      // de tiempo. Como el rival ya había "pasado" el turno, cuando llegaba el 2°
+      // movimiento la validación anti-desync lo descartaba con "no es turno del rival".
+      // Solución: detectar el galope por `abilityLabel` (parámetro local de
+      // executeMove, siempre actualizado) en vez del state stale. Y preservar
+      // `aiMode` usando el callback form de setState.
+      if (abilityLabel === 'Doble Galope (1°)') {
         const newBoard = computeBoard(newPieces);
         const nextMoves = getRawMoves(newBoard, toRow, toCol);
         if (nextMoves.length > 0) {
-          setPendingJinete({ pieceId, phase: 'second' });
-          setSelectedId(pieceId);
-          setHighlights(nextMoves);
+          setPendingJinete(prev => ({
+            pieceId,
+            phase: 'second',
+            ...(prev && prev.aiMode ? { aiMode: true } : {})
+          }));
+          // Solo mostrar highlights al jugador que controla la pieza
+          // (en online, el rival no debe ver highlights sobre la pieza enemiga)
+          if (piece.color === myColor) {
+            setSelectedId(pieceId);
+            setHighlights(nextMoves);
+          }
           return;
         }
       }
