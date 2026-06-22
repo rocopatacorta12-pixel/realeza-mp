@@ -76,16 +76,32 @@ const PIECE_DATA = {
 
 const PIECE_ORDER = ['monarca','caballero','hechicera','fortaleza','jinete','druida','infante'];
 
+// ===== NIVELES DE DIFICULTAD DE LA IA =====
+// Cada nivel ajusta CUATRO palancas (las 4 que recomienda la teoría de motores de juego):
+//   1) maxDepth + timeMs  -> qué tan profundo "piensa" (profundización iterativa con tope de tiempo).
+//   2) flags de evaluación -> qué tan rica es su lectura del tablero (material, posición, amenazas,
+//      movilidad, seguridad del Monarca, control del centro, distancia de habilidades).
+//   3) quiescence          -> búsqueda de quietud: evita el "efecto horizonte" (regalar piezas).
+//   4) randomness / abilities -> azar controlado y uso de habilidades, para los niveles fáciles.
+// timeMs es el presupuesto de "pensar" por jugada. Recomendado: ~1s en Invencible (fuerte pero no aburrido).
 const DIFFICULTY_LEVELS = {
-  muy_facil:  { label: 'Muy fácil', depth: 1, randomness: 0.65, abilities: 'none', positional: false, advanced: false },
-  facil:      { label: 'Fácil',     depth: 1, randomness: 0.25, abilities: 'none', positional: false, advanced: false },
-  normal:     { label: 'Normal',    depth: 2, randomness: 0.08, abilities: 'basic', positional: false, advanced: false },
-  // Difícil: ~20% chance de ganarle. depth 3, evaluación con consideraciones tácticas
-  dificil:    { label: 'Difícil',   depth: 3, randomness: 0.02, abilities: 'all', positional: true,  advanced: false },
-  // Experto: ~10% chance. depth 3 con evaluación más profunda + amenazas
-  experto:    { label: 'Experto',   depth: 3, randomness: 0.0,  abilities: 'all', positional: true,  advanced: true,  threatEval: true },
-  // Invencible: ~0.05% chance. depth 4 con evaluación completísima + amenazas + control del centro
-  invencible: { label: 'Invencible',depth: 4, randomness: 0.0,  abilities: 'all', positional: true,  advanced: true,  threatEval: true, kingSafety: true },
+  // --- De Normal para abajo: progresión suave para aprender ---
+  muy_facil:  { label: 'Muy fácil',  maxDepth: 1, timeMs: 0,    randomness: 0.75, safeRandom: false, abilities: 'none',  maxAbilities: 0,
+                positional: false, threatEval: false, mobility: false, kingSafety: false, abilityThreat: false, centerControl: false, quiescence: false, qdepth: 0, advanced: false },
+  facil:      { label: 'Fácil',      maxDepth: 1, timeMs: 0,    randomness: 0.35, safeRandom: false, abilities: 'basic', maxAbilities: 1,
+                positional: true,  threatEval: false, mobility: false, kingSafety: false, abilityThreat: false, centerControl: false, quiescence: false, qdepth: 0, advanced: false },
+  normal:     { label: 'Normal',     maxDepth: 2, timeMs: 0,    randomness: 0.16, safeRandom: false, abilities: 'basic', maxAbilities: 3,
+                positional: true,  threatEval: false, mobility: false, kingSafety: false, abilityThreat: false, centerControl: false, quiescence: false, qdepth: 0, advanced: false },
+  // --- Difícil (~25%): táctica real, ya con quiescence para no regalar piezas ---
+  dificil:    { label: 'Difícil',    maxDepth: 3, timeMs: 350,  randomness: 0.06, safeRandom: true,  abilities: 'all',   maxAbilities: Infinity,
+                positional: true,  threatEval: true,  mobility: true,  kingSafety: false, abilityThreat: false, centerControl: false, quiescence: true,  qdepth: 3, advanced: false },
+  // --- Experto (~10%): juego maestro, casi sin fisuras pero NO milimétrico ---
+  experto:    { label: 'Experto',    maxDepth: 4, timeMs: 650,  randomness: 0.03, safeRandom: true,  abilities: 'all',   maxAbilities: Infinity,
+                positional: true,  threatEval: true,  mobility: true,  kingSafety: true,  abilityThreat: false, centerControl: false, quiescence: true,  qdepth: 4, advanced: true },
+  // --- Invencible (~0.05%): calcula TODO. Distancia de habilidades propias y rivales,
+  //     seguridad del Monarca, control del centro, contraataque y defensa ---
+  invencible: { label: 'Invencible', maxDepth: 5, timeMs: 1000, randomness: 0.0,  safeRandom: true,  abilities: 'all',   maxAbilities: Infinity,
+                positional: true,  threatEval: true,  mobility: true,  kingSafety: true,  abilityThreat: true,  centerControl: true,  quiescence: true,  qdepth: 6, advanced: true },
 };
 
 const COLORS = {
@@ -212,11 +228,40 @@ function pstBonus(piece, r, c) {
   return central * 0.5;
 }
 
+// Casillas que la HABILIDAD de captura de una pieza alcanza, SI está disponible (cooldown 0).
+// Sirve para que Invencible calcule "distancias de habilidades": mantener sus piezas valiosas
+// fuera del alcance de las habilidades rivales, y poner al rival dentro del alcance de las suyas.
+function abilityReachSet(board, r, c, piece, cd) {
+  const set = new Set();
+  const t = piece.type;
+  if (t === 'hechicera' && (cd.hechicera || 0) === 0) {
+    for (let dr = -3; dr <= 3; dr++) for (let dc = -3; dc <= 3; dc++) {
+      if (dr === 0 && dc === 0) continue;
+      const nr = r + dr, nc = c + dc;
+      if (inBounds(nr, nc)) set.add(nr + ',' + nc);
+    }
+  } else if (t === 'fortaleza' && (cd.fortaleza || 0) === 0) {
+    for (const [dr, dc] of DIR8) { const nr = r + dr, nc = c + dc; if (inBounds(nr, nc)) set.add(nr + ',' + nc); }
+  } else if (t === 'caballero' && (cd.caballero || 0) === 0) {
+    for (const [dr, dc] of DIR8) for (let i = 1; i <= 4; i++) {
+      const nr = r + dr * i, nc = c + dc * i;
+      if (!inBounds(nr, nc)) break;
+      set.add(nr + ',' + nc);
+      if (board[nr][nc]) break;
+    }
+  } else if (t === 'jinete' && (cd.jinete || 0) === 0) {
+    for (const [dr, dc] of JINETE_OFFSETS) { const nr = r + dr, nc = c + dc; if (inBounds(nr, nc)) set.add(nr + ',' + nc); }
+  }
+  return set;
+}
+
 function evalBoard(board, color, opts) {
-  const positional = opts && opts.positional;
-  const threatEval = opts && opts.threatEval;
-  const kingSafety = opts && opts.kingSafety;
-  const advanced = opts && opts.advanced;
+  const positional    = opts && opts.positional;
+  const threatEval    = opts && opts.threatEval;
+  const kingSafety    = opts && opts.kingSafety;
+  const mobility      = opts && opts.mobility;
+  const centerControl = opts && opts.centerControl;
+  const abilityThreat = opts && opts.abilityThreat;
 
   let s = 0;
   let kingPosMe = null, kingPosEnemy = null;
@@ -243,53 +288,78 @@ function evalBoard(board, color, opts) {
     }
   }
 
-  if (!threatEval && !kingSafety) return s;
-
-  // Evaluación de amenazas: piezas atacadas/defendidas
-  if (threatEval) {
-    // Generar todos los movimientos posibles de ambos colores (incluye capturas)
-    // Si una pieza propia está atacada y no defendida, penalizar
-    // Si una pieza enemiga está atacada por nosotros, bonificar
-    const myThreats = new Map();   // "r,c" -> attack count by us
-    const enemyThreats = new Map();// "r,c" -> attack count by enemy
+  // Mapas de ataque (amenazas), movilidad y control del centro: una sola pasada compartida.
+  const needMaps = threatEval || mobility || centerControl;
+  if (needMaps) {
+    const myThreats = new Map();   // "r,c" -> veces atacada por mí
+    const enemyThreats = new Map();// "r,c" -> veces atacada por el rival
+    let myMob = 0, enemyMob = 0;
 
     for (let r = 0; r < BOARD_SIZE; r++) {
       for (let c = 0; c < BOARD_SIZE; c++) {
         const p = board[r][c];
         if (!p) continue;
         const moves = getRawMoves(board, r, c);
+        if (p.color === color) myMob += moves.length; else enemyMob += moves.length;
         for (const [nr, nc] of moves) {
           const key = `${nr},${nc}`;
-          if (p.color === color) {
-            myThreats.set(key, (myThreats.get(key) || 0) + 1);
-          } else {
-            enemyThreats.set(key, (enemyThreats.get(key) || 0) + 1);
+          if (p.color === color) myThreats.set(key, (myThreats.get(key) || 0) + 1);
+          else enemyThreats.set(key, (enemyThreats.get(key) || 0) + 1);
+        }
+      }
+    }
+
+    if (threatEval) {
+      for (let r = 0; r < BOARD_SIZE; r++) {
+        for (let c = 0; c < BOARD_SIZE; c++) {
+          const p = board[r][c];
+          if (!p) continue;
+          const key = `${r},${c}`;
+          const attackedByMe = myThreats.get(key) || 0;
+          const attackedByEnemy = enemyThreats.get(key) || 0;
+          const v = PIECE_DATA[p.type].value;
+          if (p.color === enemy && attackedByMe > 0) s += v * 0.15;       // amenazo al rival
+          if (p.color === color && attackedByEnemy > 0) {
+            s -= (attackedByMe === 0) ? v * 0.45 : v * 0.1;               // mi pieza en peligro
           }
         }
       }
     }
 
-    // Bonificar piezas enemigas atacadas
+    // Movilidad: más jugadas disponibles = más actividad.
+    if (mobility) s += (myMob - enemyMob) * 0.02;
+
+    // Control del centro: cuántas casillas centrales domino vs el rival.
+    if (centerControl) {
+      let myCenter = 0, enemyCenter = 0;
+      for (let r = 3; r <= 5; r++) for (let c = 3; c <= 5; c++) {
+        const key = `${r},${c}`;
+        myCenter += myThreats.get(key) || 0;
+        enemyCenter += enemyThreats.get(key) || 0;
+      }
+      s += (myCenter - enemyCenter) * 0.05;
+    }
+  }
+
+  // Distancia de habilidades (contraataque y defensa fina):
+  // penalizo tener piezas valiosas al alcance de habilidades rivales disponibles,
+  // y premio tener al rival al alcance de mis habilidades disponibles.
+  if (abilityThreat && opts.myCooldowns && opts.enemyCooldowns) {
     for (let r = 0; r < BOARD_SIZE; r++) {
       for (let c = 0; c < BOARD_SIZE; c++) {
         const p = board[r][c];
         if (!p) continue;
-        const key = `${r},${c}`;
-        const attackedByMe = myThreats.get(key) || 0;
-        const attackedByEnemy = enemyThreats.get(key) || 0;
-        const v = PIECE_DATA[p.type].value;
-        if (p.color === enemy && attackedByMe > 0) {
-          // Pieza enemiga atacada: bonus proporcional a su valor
-          s += v * 0.15;
-        }
-        if (p.color === color && attackedByEnemy > 0) {
-          // Pieza propia atacada
-          if (attackedByMe === 0) {
-            // Sin defensa: penalización fuerte
-            s -= v * 0.45;
-          } else {
-            s -= v * 0.1;
-          }
+        const cd = p.color === color ? opts.myCooldowns : opts.enemyCooldowns;
+        const reach = abilityReachSet(board, r, c, p, cd);
+        if (reach.size === 0) continue;
+        for (const cell of reach) {
+          const ci = cell.indexOf(',');
+          const tr = +cell.slice(0, ci), tc = +cell.slice(ci + 1);
+          const tp = board[tr][tc];
+          if (!tp || tp.color === p.color) continue;
+          const tv = PIECE_DATA[tp.type].value;
+          if (p.color === color) s += tv * 0.12;   // mi habilidad amenaza al rival
+          else s -= tv * 0.14;                      // habilidad rival amenaza mi pieza
         }
       }
     }
@@ -349,11 +419,69 @@ function kingExists(board, color) {
   return false;
 }
 
-function minimax(board, depth, alpha, beta, maxColor, curColor, opts) {
+// Sólo las capturas de un color (para la búsqueda de quietud), ordenadas por valor.
+function capturesForColor(board, color) {
+  const caps = [];
+  for (let r = 0; r < BOARD_SIZE; r++) for (let c = 0; c < BOARD_SIZE; c++) {
+    const p = board[r][c];
+    if (p && p.color === color) {
+      for (const [nr, nc] of getRawMoves(board, r, c)) {
+        const t = board[nr][nc];
+        if (t && t.color !== color) caps.push({ from: [r, c], to: [nr, nc], val: PIECE_DATA[t.type].value });
+      }
+    }
+  }
+  caps.sort((a, b) => b.val - a.val);
+  return caps;
+}
+
+// Búsqueda de quietud: en las hojas seguimos jugando SÓLO capturas hasta una posición
+// "tranquila". Evita el "efecto horizonte" (creer que ganó una pieza cuando en realidad
+// se la recapturan). Es lo que elimina los blunders de la IA.
+function quiescence(board, alpha, beta, maxColor, curColor, opts, qdepth, deadline) {
+  if (deadline && Date.now() > deadline) throw 'TIMEOUT';
+  if (!kingExists(board, maxColor)) return -100000;
+  const other = maxColor === 'gold' ? 'crimson' : 'gold';
+  if (!kingExists(board, other)) return 100000;
+  const standPat = evalBoard(board, maxColor, opts);
+  if (qdepth <= 0) return standPat;
+  const caps = capturesForColor(board, curColor);
+  if (caps.length === 0) return standPat;
+  const next = curColor === 'gold' ? 'crimson' : 'gold';
+  if (curColor === maxColor) {
+    if (standPat >= beta) return beta;
+    if (standPat > alpha) alpha = standPat;
+    for (const cap of caps) {
+      const nb = applyMoveSim(board, cap.from, cap.to);
+      const v = quiescence(nb, alpha, beta, maxColor, next, opts, qdepth - 1, deadline);
+      if (v > alpha) alpha = v;
+      if (alpha >= beta) break;
+    }
+    return alpha;
+  } else {
+    if (standPat <= alpha) return alpha;
+    if (standPat < beta) beta = standPat;
+    for (const cap of caps) {
+      const nb = applyMoveSim(board, cap.from, cap.to);
+      const v = quiescence(nb, alpha, beta, maxColor, next, opts, qdepth - 1, deadline);
+      if (v < beta) beta = v;
+      if (beta <= alpha) break;
+    }
+    return beta;
+  }
+}
+
+function minimax(board, depth, alpha, beta, maxColor, curColor, opts, deadline) {
+  if (deadline && Date.now() > deadline) throw 'TIMEOUT';
   if (!kingExists(board, maxColor)) return { score: -100000 - depth };
   const otherColor = maxColor === 'gold' ? 'crimson' : 'gold';
   if (!kingExists(board, otherColor)) return { score: 100000 + depth };
-  if (depth === 0) return { score: evalBoard(board, maxColor, opts) };
+  if (depth === 0) {
+    const score = opts.quiescence
+      ? quiescence(board, alpha, beta, maxColor, curColor, opts, opts.qdepth || 4, deadline)
+      : evalBoard(board, maxColor, opts);
+    return { score };
+  }
   const moves = findAllMovesForColor(board, curColor);
   if (moves.length === 0) return { score: evalBoard(board, maxColor, opts) };
 
@@ -364,12 +492,13 @@ function minimax(board, depth, alpha, beta, maxColor, curColor, opts) {
   }
   moves.sort((a, b) => b._score - a._score);
 
+  const nextColor = curColor === 'gold' ? 'crimson' : 'gold';
   let best = null;
   if (curColor === maxColor) {
     let v = -Infinity;
     for (const m of moves) {
       const nb = applyMoveSim(board, m.from, m.to);
-      const r = minimax(nb, depth - 1, alpha, beta, maxColor, curColor === 'gold' ? 'crimson' : 'gold', opts);
+      const r = minimax(nb, depth - 1, alpha, beta, maxColor, nextColor, opts, deadline);
       if (r.score > v) { v = r.score; best = m; }
       alpha = Math.max(alpha, v);
       if (beta <= alpha) break;
@@ -379,7 +508,7 @@ function minimax(board, depth, alpha, beta, maxColor, curColor, opts) {
     let v = Infinity;
     for (const m of moves) {
       const nb = applyMoveSim(board, m.from, m.to);
-      const r = minimax(nb, depth - 1, alpha, beta, maxColor, curColor === 'gold' ? 'crimson' : 'gold', opts);
+      const r = minimax(nb, depth - 1, alpha, beta, maxColor, nextColor, opts, deadline);
       if (r.score < v) { v = r.score; best = m; }
       beta = Math.min(beta, v);
       if (beta <= alpha) break;
@@ -388,21 +517,62 @@ function minimax(board, depth, alpha, beta, maxColor, curColor, opts) {
   }
 }
 
-function aiChooseRegularMove(board, color, difficulty) {
-  const cfg = DIFFICULTY_LEVELS[difficulty];
+// Movimiento al azar que NO regala el Monarca (para que el azar de Difícil/Experto
+// no termine en una metida de pata catastrófica).
+function pickSafeRandom(board, moves, color) {
+  const enemy = color === 'gold' ? 'crimson' : 'gold';
+  const ok = moves.filter(m => {
+    const nb = applyMoveSim(board, m.from, m.to);
+    const eMoves = findAllMovesForColor(nb, enemy);
+    return !eMoves.some(em => {
+      const t = nb[em.to[0]][em.to[1]];
+      return t && t.type === 'monarca' && t.color === color;
+    });
+  });
+  const pool = ok.length ? ok : moves;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// Elige el mejor movimiento "normal" según el nivel. Devuelve { move, score }.
+// `opts` ya trae las flags de evaluación + los cooldowns de ambos colores.
+function aiChooseRegularMove(board, color, cfg, opts) {
   const moves = findAllMovesForColor(board, color);
   if (moves.length === 0) return null;
+
+  // Jugada ganadora forzada: si puede capturar el Monarca rival, lo hace siempre.
+  const winMove = moves.find(m => {
+    const t = board[m.to[0]][m.to[1]];
+    return t && t.type === 'monarca' && t.color !== color;
+  });
+  if (winMove) return { move: winMove, score: 100000 };
+
+  // Azar controlado (niveles fáciles).
   if (cfg.randomness > 0 && Math.random() < cfg.randomness) {
-    return moves[Math.floor(Math.random() * moves.length)];
+    const m = cfg.safeRandom ? pickSafeRandom(board, moves, color)
+                             : moves[Math.floor(Math.random() * moves.length)];
+    return { move: m, score: 0 };
   }
-  const opts = {
-    positional: !!cfg.positional,
-    threatEval: !!cfg.threatEval,
-    kingSafety: !!cfg.kingSafety,
-    advanced: !!cfg.advanced,
-  };
-  const result = minimax(board, cfg.depth, -Infinity, Infinity, color, color, opts);
-  return result.move;
+
+  // Profundización iterativa con presupuesto de tiempo: busca 1, 2, 3... niveles
+  // hasta agotar el tiempo, quedándose con la última profundidad completada.
+  const deadline = cfg.timeMs > 0 ? Date.now() + cfg.timeMs : null;
+  let best = null, bestScore = -Infinity;
+  for (let d = 1; d <= cfg.maxDepth; d++) {
+    try {
+      const r = minimax(board, d, -Infinity, Infinity, color, color, opts, deadline);
+      if (r.move) { best = r.move; bestScore = r.score; }
+    } catch (e) {
+      if (e === 'TIMEOUT') break;
+      throw e;
+    }
+  }
+  if (!best) {
+    // Salvaguarda: si ni siquiera completó profundidad 1, hacer una búsqueda sin límite.
+    const r = minimax(board, 1, -Infinity, Infinity, color, color, opts, null);
+    best = r.move || moves[0];
+    bestScore = (r.score !== undefined) ? r.score : 0;
+  }
+  return { move: best, score: bestScore };
 }
 
 // AI ability selection
@@ -1294,12 +1464,12 @@ function ReglasTab() {
 
       <Section title="DIFICULTAD DE LA IA">
         <ul style={{ paddingLeft: 18, marginTop: 0 }}>
-          <li style={li}><strong>Muy fácil</strong>: IA aleatoria, sin habilidades. Para aprender los movimientos.</li>
-          <li style={li}><strong>Fácil</strong>: empieza a buscar capturas. Sin habilidades aún.</li>
-          <li style={li}><strong>Normal</strong>: busca 2 jugadas adelante. Usa Aplastar, Hechizo Letal y Embestida.</li>
-          <li style={li}><strong>Difícil</strong>: busca 3 jugadas adelante con evaluación posicional. Usa TODAS las habilidades. Pensá tus jugadas.</li>
-          <li style={li}><strong>Experto</strong>: 3 niveles de profundidad con análisis de amenazas y defensas. Es muy difícil de derrotar.</li>
-          <li style={li}><strong>Invencible</strong>: 4 niveles de profundidad, evaluación completísima con seguridad del Monarca y control del tablero. Solo los mejores podrán vencerla.</li>
+          <li style={li}><strong>Muy fácil</strong>: juega casi al azar y NO usa habilidades. Ideal para aprender los movimientos.</li>
+          <li style={li}><strong>Fácil</strong>: piensa su movimiento y busca capturas, pero comete errores. Usa como máximo 1 habilidad en toda la partida.</li>
+          <li style={li}><strong>Normal</strong>: calcula 2 jugadas hacia adelante y usa unas pocas habilidades básicas (Aplastar, Hechizo Letal, Embestida).</li>
+          <li style={li}><strong>Difícil</strong>: táctica real. Calcula hasta 3 jugadas, evita regalar piezas, evalúa amenazas y movilidad, y usa TODAS las habilidades. Acá ya cuesta ganar (~25%).</li>
+          <li style={li}><strong>Experto</strong>: calcula hasta 4 jugadas con seguridad del Monarca y mide si conviene gastar una habilidad antes de usarla. Juego maestro, muy pocas fisuras (~10%).</li>
+          <li style={li}><strong>Invencible</strong>: calcula TODO. Hasta 5 jugadas (~1 seg de cálculo), mide la distancia de sus habilidades y de las tuyas para que no la alcances, lleva memoria de los cooldowns y domina el centro. Ganarle es casi imposible (~0,05%).</li>
         </ul>
       </Section>
 
@@ -1428,6 +1598,8 @@ function JugarTab({ multiplayer = null }) {
   const oncePerGameRef = useRef(oncePerGame);
   const turnNumberRef = useRef(turnNumber);
   const turnRef = useRef(turn);
+  // Memoria de la IA: cuántas habilidades usó en la partida (para el tope por nivel).
+  const aiAbilitiesUsedRef = useRef(0);
   useEffect(() => { piecesRef.current = pieces; }, [pieces]);
   useEffect(() => { cooldownsRef.current = cooldowns; }, [cooldowns]);
   useEffect(() => { oncePerGameRef.current = oncePerGame; }, [oncePerGame]);
@@ -1489,6 +1661,7 @@ function JugarTab({ multiplayer = null }) {
     setLog([]); setCaptured({ gold: [], crimson: [] }); setAiThinking(false);
     setAnimating(false);
     setTurnNumber(0);
+    aiAbilitiesUsedRef.current = 0;
   }
 
   const selectedPiece = selectedId ? pieces.find(p => p.id === selectedId && !p.captured) : null;
@@ -1725,66 +1898,67 @@ function JugarTab({ multiplayer = null }) {
     setAiThinking(true);
     const handle = setTimeout(() => {
       const curBoard = computeBoard(piecesRef.current);
+      const cfg = DIFFICULTY_LEVELS[difficulty];
+      const cds = cooldownsRef.current;
 
-      // 1. Try ability move first if difficulty allows
-      const abilityMove = findAIAbility(
-        curBoard, 'crimson',
-        cooldownsRef.current, oncePerGameRef.current,
-        difficulty, turnNumberRef.current
-      );
+      // Opciones de evaluación + memoria de cooldowns de AMBOS colores.
+      // (La IA es crimson; gold es el rival.)
+      const opts = {
+        positional: !!cfg.positional, threatEval: !!cfg.threatEval,
+        mobility: !!cfg.mobility, kingSafety: !!cfg.kingSafety,
+        centerControl: !!cfg.centerControl, abilityThreat: !!cfg.abilityThreat,
+        quiescence: !!cfg.quiescence, qdepth: cfg.qdepth || 4, advanced: !!cfg.advanced,
+        myCooldowns: cds.crimson || {}, enemyCooldowns: cds.gold || {},
+      };
 
-      // 2. Get regular move
-      const regularMove = aiChooseRegularMove(curBoard, 'crimson', difficulty);
+      // 1. Mejor movimiento normal (búsqueda principal).
+      const regResult = aiChooseRegularMove(curBoard, 'crimson', cfg, opts);
+      const regularMove = regResult ? regResult.move : null;
+      const regularScore = regResult ? regResult.score : -Infinity;
+
+      // 2. Habilidad candidata (respetando el tope de habilidades del nivel).
+      const maxAb = (cfg.maxAbilities === undefined) ? Infinity : cfg.maxAbilities;
+      const abilitiesAllowed = cfg.abilities !== 'none' && aiAbilitiesUsedRef.current < maxAb;
+      const abilityMove = abilitiesAllowed
+        ? findAIAbility(curBoard, 'crimson', cds, oncePerGameRef.current, difficulty, turnNumberRef.current)
+        : null;
 
       setAiThinking(false);
 
-      // Decide: ability or regular?
-      const cfg = DIFFICULTY_LEVELS[difficulty];
       let regularCaptureValue = 0;
       if (regularMove && curBoard[regularMove.to[0]][regularMove.to[1]]) {
         regularCaptureValue = PIECE_DATA[curBoard[regularMove.to[0]][regularMove.to[1]].type].value;
       }
 
-      // En experto/invencible: simular el resultado de la habilidad y comparar evaluación global
-      // En lugar de comparar valores crudos.
+      // ¿Habilidad o movimiento normal?
       let useAbility = false;
       if (abilityMove) {
         if (cfg.advanced) {
-          // Simulación: aplicar la habilidad y evaluar el tablero
+          // Simular el tablero resultante de la habilidad.
           let simBoard = curBoard.map(row => row.slice());
           if (abilityMove.abilityType === 'fortaleza' || abilityMove.abilityType === 'hechicera') {
-            // captura sin moverse
-            simBoard[abilityMove.target[0]][abilityMove.target[1]] = null;
-          } else if (abilityMove.abilityType === 'caballero' || abilityMove.abilityType === 'monarca') {
-            // movimiento extendido
+            simBoard[abilityMove.target[0]][abilityMove.target[1]] = null; // captura sin moverse
+          } else if (abilityMove.abilityType === 'caballero' || abilityMove.abilityType === 'monarca' || abilityMove.abilityType === 'jinete') {
             simBoard = applyMoveSim(curBoard, abilityMove.from, abilityMove.target);
           } else if (abilityMove.abilityType === 'druida') {
-            // spawn de infante
             simBoard[abilityMove.target[0]][abilityMove.target[1]] = {
               type: 'infante', color: 'crimson', row: abilityMove.target[0], col: abilityMove.target[1]
             };
           } else if (abilityMove.abilityType === 'infante') {
-            // coronación
             const inf = simBoard[abilityMove.from[0]][abilityMove.from[1]];
-            if (inf) {
-              simBoard[abilityMove.from[0]][abilityMove.from[1]] = { ...inf, type: abilityMove.newType || 'caballero' };
-            }
-          } else if (abilityMove.abilityType === 'jinete') {
-            simBoard = applyMoveSim(curBoard, abilityMove.from, abilityMove.target);
+            if (inf) simBoard[abilityMove.from[0]][abilityMove.from[1]] = { ...inf, type: abilityMove.newType || 'caballero' };
           }
-          const evalAfterAbility = evalBoard(simBoard, 'crimson', {
-            positional: cfg.positional, threatEval: cfg.threatEval,
-            kingSafety: cfg.kingSafety, advanced: cfg.advanced
-          });
-          // Movimiento regular: usar score del minimax (no se recalcula aquí pero approximamos)
-          let simBoardReg = curBoard;
-          if (regularMove) simBoardReg = applyMoveSim(curBoard, regularMove.from, regularMove.to);
-          const evalAfterRegular = evalBoard(simBoardReg, 'crimson', {
-            positional: cfg.positional, threatEval: cfg.threatEval,
-            kingSafety: cfg.kingSafety, advanced: cfg.advanced
-          });
-          useAbility = evalAfterAbility > evalAfterRegular + 0.3;
-          // Forzar habilidad defensiva del monarca si está bajo amenaza
+          // Evaluar la habilidad CONTANDO la respuesta del rival (mini-búsqueda),
+          // así no usa una habilidad que termina perdiendo material al turno siguiente.
+          let abilityScore;
+          try {
+            const respDepth = difficulty === 'invencible' ? 2 : 1;
+            abilityScore = minimax(simBoard, respDepth, -Infinity, Infinity, 'crimson', 'gold', opts, Date.now() + 250).score;
+          } catch (e) {
+            abilityScore = evalBoard(simBoard, 'crimson', opts);
+          }
+          useAbility = abilityScore > regularScore + 0.25;
+          // Habilidad defensiva del Monarca: si está bajo amenaza, siempre escapar.
           if (abilityMove.abilityType === 'monarca' && abilityMove.score >= 100) useAbility = true;
         } else {
           useAbility = (abilityMove.score > regularCaptureValue) || abilityMove.abilityType === 'monarca';
@@ -1796,11 +1970,11 @@ function JugarTab({ multiplayer = null }) {
       } else if (regularMove) {
         executeMove(regularMove.pieceId, regularMove.to[0], regularMove.to[1]);
       } else {
-        // No legal moves
+        // Sin jugadas legales
         setWinner('gold');
         playVictory();
       }
-    }, 600);
+    }, 150);
     return () => clearTimeout(handle);
   }, [isAiTurn, difficulty]);
 
@@ -1808,6 +1982,7 @@ function JugarTab({ multiplayer = null }) {
     const { abilityType, pieceId, target, newType } = abilityMove;
     const piece = piecesRef.current.find(p => p.id === pieceId);
     if (!piece) return;
+    aiAbilitiesUsedRef.current += 1; // memoria: la IA registra cada habilidad usada
 
     if (abilityType === 'fortaleza') {
       const targetPiece = piecesRef.current.find(p => !p.captured && p.row === target[0] && p.col === target[1]);
@@ -2281,7 +2456,11 @@ function JugarTab({ multiplayer = null }) {
       )}
 
       {/* Difficulty selector (solo en modo IA) */}
-      {!multiplayer && (
+      {!multiplayer && (() => {
+        // La dificultad se bloquea apenas empieza la partida (se hizo al menos un movimiento).
+        // Para cambiarla hay que REINICIAR y elegir antes de empezar.
+        const difficultyLocked = turnNumber > 0;
+        return (
         <div style={{
           background: COLORS.card, borderRadius: 10, padding: '10px 12px',
           border: `1px solid ${COLORS.goldDeep}66`,
@@ -2289,23 +2468,41 @@ function JugarTab({ multiplayer = null }) {
           <div style={{
             fontSize: 10, letterSpacing: 1.5, color: COLORS.gold,
             fontFamily: 'Cinzel, serif', fontWeight: 600, marginBottom: 6,
-          }}>DIFICULTAD</div>
+            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          }}>
+            <span>DIFICULTAD</span>
+            {difficultyLocked && (
+              <span style={{ fontSize: 9, color: COLORS.inkMute, letterSpacing: 0.5, fontWeight: 400 }}>
+                🔒 Reiniciá para cambiar
+              </span>
+            )}
+          </div>
           <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-            {Object.entries(DIFFICULTY_LEVELS).map(([key, cfg]) => (
-              <button key={key} onClick={() => setDifficulty(key)} style={{
-                flex: '1 1 auto', minWidth: 80,
-                background: difficulty === key ? COLORS.gold : 'transparent',
-                color: difficulty === key ? '#1A1410' : COLORS.ink,
-                border: `1px solid ${difficulty === key ? COLORS.gold : COLORS.goldDeep + '88'}`,
-                borderRadius: 4, padding: '6px 8px',
-                fontFamily: 'Cinzel, serif', fontWeight: 600,
-                fontSize: 11, letterSpacing: 1, cursor: 'pointer',
-                transition: 'all 0.15s',
-              }}>{cfg.label}</button>
-            ))}
+            {Object.entries(DIFFICULTY_LEVELS).map(([key, cfg]) => {
+              const isSel = difficulty === key;
+              return (
+              <button
+                key={key}
+                disabled={difficultyLocked}
+                onClick={() => { if (!difficultyLocked) setDifficulty(key); }}
+                style={{
+                  flex: '1 1 auto', minWidth: 80,
+                  background: isSel ? COLORS.gold : 'transparent',
+                  color: isSel ? '#1A1410' : COLORS.ink,
+                  border: `1px solid ${isSel ? COLORS.gold : COLORS.goldDeep + '88'}`,
+                  borderRadius: 4, padding: '6px 8px',
+                  fontFamily: 'Cinzel, serif', fontWeight: 600,
+                  fontSize: 11, letterSpacing: 1,
+                  cursor: difficultyLocked ? 'not-allowed' : 'pointer',
+                  opacity: difficultyLocked && !isSel ? 0.4 : 1,
+                  transition: 'all 0.15s',
+                }}>{cfg.label}</button>
+              );
+            })}
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* Scenario selector */}
       <div style={{
