@@ -579,18 +579,68 @@ function setEffects(on) {
 function setAmbient(on) {
   soundConfig.ambient = on;
   setStoredBool('realeza_ambient', on);
-  if (on) startAmbient();
-  else stopAmbient();
+  if (on) {
+    // ensureAudio inicia el audio context (si hace falta) y luego llama startAmbient.
+    // Como esto se dispara desde un toggle del usuario, el "user gesture" es válido.
+    ensureAudio();
+  } else {
+    stopAmbient();
+  }
+}
+
+// =====================================================================
+// === SFX por archivo mp3 (carpeta /public/sounds, 17 archivos) ===
+// Cacheamos un objeto Audio "base" por nombre y cloneNode() en cada play
+// para permitir que se solapen sin tener que resetear currentTime.
+// Respeta soundConfig.effects (toggle de "Sonidos de piezas").
+// =====================================================================
+const sfxCache = new Map();
+function getBaseAudio(name) {
+  if (sfxCache.has(name)) return sfxCache.get(name);
+  const a = new Audio(`sounds/${name}.mp3`);
+  a.preload = 'auto';
+  sfxCache.set(name, a);
+  return a;
+}
+function playSfx(name, volume = 0.9) {
+  if (!soundConfig.effects) return;
+  try {
+    const base = getBaseAudio(name);
+    const inst = base.cloneNode();
+    inst.volume = volume;
+    const p = inst.play();
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch (_) {}
+}
+// Lista de todos los nombres (sin extensión) — usado para precarga.
+const SFX_NAMES = [
+  'move_monarca','move_hechicera','move_fortaleza','move_druida',
+  'move_jinete','move_caballero','move_infante',
+  'ability_monarca_salto_real','ability_hechicera_hechizo_letal',
+  'ability_fortaleza_aplastar','ability_druida_brote',
+  'ability_jinete_doble_galope','ability_caballero_embestida',
+  'ability_infante_coronacion',
+  'capture_generic','victory','alert_check_monarca',
+];
+let sfxPreloaded = false;
+function preloadSfx() {
+  if (sfxPreloaded) return;
+  sfxPreloaded = true;
+  SFX_NAMES.forEach(n => { try { getBaseAudio(n).load(); } catch (_) {} });
 }
 
 async function ensureAudio() {
-  if (audioStarted) return;
-  try {
-    await Tone.start();
-    audioStarted = true;
-    if (!synths) initSynths();
-    if (soundConfig.ambient) startAmbient();
-  } catch (e) { console.warn(e); }
+  // Precargar los mp3 en el primer gesto del usuario (mobile-friendly).
+  preloadSfx();
+  if (!audioStarted) {
+    try {
+      await Tone.start();
+      audioStarted = true;
+      if (!synths) initSynths();
+    } catch (e) { console.warn(e); return; }
+  }
+  // Siempre intentar arrancar ambient si está habilitado (idempotente)
+  if (soundConfig.ambient) startAmbient();
 }
 
 // === Música ambiente: acordes suaves, etéreos, en loop ===
@@ -605,7 +655,7 @@ function startAmbient() {
   if (ambientInterval) return; // ya está sonando
   try {
     if (!ambientReverb) {
-      ambientReverb = new Tone.Reverb({ decay: 7, wet: 0.35 }).toDestination();
+      ambientReverb = new Tone.Reverb({ decay: 8, wet: 0.45 }).toDestination();
     }
     if (!ambientChorus) {
       // Chorus suave: engorda el pad y le da movimiento tipo "respiración"
@@ -618,14 +668,16 @@ function startAmbient() {
         oscillator: { type: 'sine' },
         envelope: { attack: 2.0, decay: 1.0, sustain: 0.7, release: 4.0 },
       }).connect(ambientChorus);
-      ambientPad.volume.value = -8;
+      // Volumen subido: -8 → 0 dB (mucho más presente, ahora se escucha bien)
+      ambientPad.volume.value = 0;
     }
     if (!ambientSynth) {
       ambientSynth = new Tone.PolySynth(Tone.Synth, {
         oscillator: { type: 'triangle' },
         envelope: { attack: 1.5, decay: 0.8, sustain: 0.5, release: 3.0 },
       }).connect(ambientChorus);
-      ambientSynth.volume.value = -14;
+      // Volumen subido: -14 → -6 dB (melodía superior más audible)
+      ambientSynth.volume.value = -6;
     }
 
     // Progresión simple en Re menor: ambiente medieval/regal suave
@@ -639,13 +691,15 @@ function startAmbient() {
     const playChord = () => {
       if (!soundConfig.ambient || !ambientPad) return;
       try {
-        ambientPad.triggerAttackRelease(progression[idx], '2n', undefined, 0.7);
+        // Velocity subida: 0.7 → 0.9 (pad más presente)
+        ambientPad.triggerAttackRelease(progression[idx], '2n', undefined, 0.9);
         // Melodía superior suave ocasional
         if (idx % 2 === 0) {
           const melody = progression[idx][2]; // nota superior
           setTimeout(() => {
             if (soundConfig.ambient && ambientSynth) {
-              try { ambientSynth.triggerAttackRelease(melody, '4n', undefined, 0.55); } catch (_) {}
+              // Velocity subida: 0.55 → 0.75
+              try { ambientSynth.triggerAttackRelease(melody, '4n', undefined, 0.75); } catch (_) {}
             }
           }, 800);
         }
@@ -737,59 +791,31 @@ function delay(ms, fn) { setTimeout(() => safe(fn), ms); }
 
 // === Select sound ===
 function playSelect() {
-  if (!soundConfig.effects) return;
-  safe(() => synths.click.triggerAttackRelease("16n"));
+  // Por instrucción: la selección de pieza queda SIN sonido (no se generó archivo).
+  // Si en el futuro querés volver al click sintético, descomentá las 2 líneas:
+  // if (!soundConfig.effects) return;
+  // safe(() => synths.click.triggerAttackRelease("16n"));
 }
 
-// === Move sounds (per piece type) ===
+// === Move sounds (per piece type) — ahora desde archivos mp3 ===
 function playMoveSound(pieceType) {
-  if (!synths || !soundConfig.effects) return;
+  if (!soundConfig.effects) return;
   switch (pieceType) {
-    case 'monarca':
-      // Deep regal step + soft echo
-      safe(() => synths.wood.triggerAttackRelease("E2", "16n"));
-      delay(60, () => synths.wood.triggerAttackRelease("E1", "32n"));
-      break;
-    case 'hechicera':
-      // Light step with magical shimmer
-      safe(() => synths.wood.triggerAttackRelease("C3", "32n"));
-      delay(20, () => synths.bell.triggerAttackRelease("32n"));
-      break;
-    case 'caballero':
-      // Solid metallic stomp
-      safe(() => synths.wood.triggerAttackRelease("G2", "16n"));
-      delay(15, () => synths.sharp.triggerAttackRelease("32n"));
-      break;
-    case 'fortaleza':
-      // Heavy stone-on-stone rumble
-      safe(() => synths.boom.triggerAttackRelease("C2", "8n"));
-      delay(40, () => synths.noise.triggerAttackRelease("16n"));
-      break;
-    case 'jinete':
-      // Galloping double-tap
-      safe(() => synths.wood.triggerAttackRelease("D3", "32n"));
-      delay(110, () => synths.wood.triggerAttackRelease("D2", "32n"));
-      break;
-    case 'druida':
-      // Soft wooden step + leaf rustle
-      safe(() => synths.wood.triggerAttackRelease("A2", "32n"));
-      delay(30, () => synths.noise.triggerAttackRelease("32n", undefined, 0.3));
-      break;
-    case 'infante':
-      // Light infantry tap
-      safe(() => synths.wood.triggerAttackRelease("B2", "32n"));
-      break;
-    default:
-      safe(() => synths.wood.triggerAttackRelease("A2", "16n"));
+    case 'monarca':   playSfx('move_monarca',   0.85); break;
+    case 'hechicera': playSfx('move_hechicera', 0.85); break;
+    case 'fortaleza': playSfx('move_fortaleza', 0.95); break;
+    case 'druida':    playSfx('move_druida',    0.85); break;
+    case 'jinete':    playSfx('move_jinete',    0.85); break;
+    case 'caballero': playSfx('move_caballero', 0.9);  break;
+    case 'infante':   playSfx('move_infante',   0.8);  break;
+    default:          playSfx('move_infante',   0.8);
   }
 }
 
-// === Capture sounds ===
+// === Capture sounds (genérico) — ahora desde archivo mp3 ===
 function playRegularCapture() {
-  if (!synths || !soundConfig.effects) return;
-  safe(() => synths.boom.triggerAttackRelease("C2", "8n"));
-  delay(30, () => synths.noise.triggerAttackRelease("16n"));
-  delay(60, () => synths.sharp.triggerAttackRelease("32n"));
+  if (!soundConfig.effects) return;
+  playSfx('capture_generic', 0.95);
 }
 
 // === KING CAPTURE - dramatic, distinct from regular capture ===
@@ -807,86 +833,28 @@ function playKingCapture() {
   delay(1300, () => synths.dark.triggerAttackRelease(["Eb2","G2","Bb2"], "2n", undefined, 0.5));
 }
 
-// === Ability sounds (one per ability, all distinct) ===
+// === Ability sounds (uno por habilidad) — ahora desde archivos mp3 ===
 function playAbility(abilityType) {
-  if (!synths || !soundConfig.effects) return;
+  if (!soundConfig.effects) return;
   switch (abilityType) {
-    case 'monarca': {
-      // SALTO REAL - regal horn fanfare ascending
-      safe(() => synths.horn.triggerAttackRelease(["C4","E4","G4"], "8n", undefined, 0.5));
-      delay(180, () => synths.horn.triggerAttackRelease(["E4","G4","C5"], "8n", undefined, 0.55));
-      delay(360, () => synths.horn.triggerAttackRelease(["G4","C5","E5"], "4n", undefined, 0.6));
-      delay(360, () => synths.bell.triggerAttackRelease("4n"));
-      break;
-    }
-    case 'hechicera': {
-      // HECHIZO LETAL - magical zap + impact
-      safe(() => synths.magic.triggerAttackRelease(["A4","C#5","E5","A5"], "16n", undefined, 0.5));
-      delay(80, () => synths.magic.triggerAttackRelease(["E6","C#6"], "32n", undefined, 0.5));
-      delay(180, () => synths.bell.triggerAttackRelease("8n"));
-      delay(240, () => synths.noise.triggerAttackRelease("16n"));
-      break;
-    }
-    case 'fortaleza': {
-      // APLASTAR - massive crash, very heavy
-      safe(() => synths.boom.triggerAttackRelease("C1", "4n"));
-      safe(() => synths.noise.triggerAttackRelease("4n"));
-      delay(100, () => synths.boom.triggerAttackRelease("F1", "8n"));
-      delay(150, () => synths.sharp.triggerAttackRelease("8n"));
-      delay(300, () => synths.boom.triggerAttackRelease("Bb0", "8n"));
-      break;
-    }
-    case 'druida': {
-      // BROTE - ethereal nature chime + growth shimmer
-      safe(() => synths.pad.triggerAttackRelease(["G3","B3","D4"], "4n", undefined, 0.4));
-      delay(120, () => synths.magic.triggerAttackRelease(["D5","F#5","A5"], "8n", undefined, 0.4));
-      delay(280, () => synths.magic.triggerAttackRelease(["G5","B5","D6"], "8n", undefined, 0.45));
-      delay(450, () => synths.bell.triggerAttackRelease("4n"));
-      break;
-    }
-    case 'caballero': {
-      // EMBESTIDA - metallic charge: gallop + sword clash
-      safe(() => synths.sharp.triggerAttackRelease("16n"));
-      safe(() => synths.wood.triggerAttackRelease("F2", "16n"));
-      delay(80, () => synths.wood.triggerAttackRelease("F2", "16n"));
-      delay(160, () => synths.wood.triggerAttackRelease("F2", "16n"));
-      delay(240, () => synths.sharp.triggerAttackRelease("16n"));
-      delay(260, () => synths.noise.triggerAttackRelease("16n"));
-      break;
-    }
-    case 'jinete': {
-      // DOBLE GALOPE - galloping rhythm 4 beats
-      const interval = 95;
-      for (let i = 0; i < 4; i++) {
-        delay(i * interval, () => synths.wood.triggerAttackRelease("E2", "32n"));
-        delay(i * interval + 40, () => synths.wood.triggerAttackRelease("E3", "32n"));
-      }
-      break;
-    }
-    case 'infante': {
-      // CORONACIÓN - triumphant rising chord
-      const notes = ["C4","E4","G4","C5","E5","G5","C6"];
-      notes.forEach((n, i) => {
-        delay(i * 80, () => synths.horn.triggerAttackRelease(n, "8n", undefined, 0.5));
-      });
-      delay(notes.length * 80 + 100, () => synths.bell.triggerAttackRelease("4n"));
-      delay(notes.length * 80 + 100, () => synths.horn.triggerAttackRelease(["C4","E4","G4","C5"], "2n", undefined, 0.5));
-      break;
-    }
-    default:
-      safe(() => synths.magic.triggerAttackRelease(["C5","E5","G5"], "8n", undefined, 0.4));
+    case 'monarca':   playSfx('ability_monarca_salto_real',      0.95); break;
+    case 'hechicera': playSfx('ability_hechicera_hechizo_letal', 0.95); break;
+    case 'fortaleza': playSfx('ability_fortaleza_aplastar',      1.0);  break;
+    case 'druida':    playSfx('ability_druida_brote',            0.9);  break;
+    case 'jinete':    playSfx('ability_jinete_doble_galope',     0.95); break;
+    case 'caballero': playSfx('ability_caballero_embestida',     0.95); break;
+    case 'infante':   playSfx('ability_infante_coronacion',      0.95); break;
+    default: break;
   }
 }
 
+// === Victory — desde archivo mp3 ===
 function playVictory() {
-  if (!synths || !soundConfig.effects) return;
-  const notes = ["C4","E4","G4","C5","E5","G5","C6","E6"];
-  notes.forEach((n, i) => {
-    delay(i * 110, () => synths.horn.triggerAttackRelease(n, "8n", undefined, 0.55));
-  });
-  delay(800, () => synths.horn.triggerAttackRelease(["C4","E4","G4","C5","E5"], "1n", undefined, 0.6));
-  delay(800, () => synths.bell.triggerAttackRelease("2n"));
+  if (!soundConfig.effects) return;
+  playSfx('victory', 1.0);
 }
+
+// === Defeat — sigue como Tone.js (no se generó archivo para derrota) ===
 
 function playDefeat() {
   if (!synths || !soundConfig.effects) return;
@@ -1041,6 +1009,10 @@ function PieceCard({ pieceType, onZoom }) {
         background: COLORS.cardLight, borderLeft: `3px solid ${COLORS.gold}`,
         padding: '10px 12px', borderRadius: 4,
       }}>
+        <div style={{
+          fontSize: 10, letterSpacing: 1.5, color: COLORS.gold,
+          fontFamily: 'Cinzel, serif', fontWeight: 600, marginBottom: 6,
+        }}>HABILIDAD ESPECIAL</div>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4, flexWrap: 'wrap', gap: 6 }}>
           <div style={{
             fontFamily: 'Cinzel, serif', fontSize: 14, fontWeight: 600,
@@ -1150,6 +1122,10 @@ function PieceZoomModal({ pieceType, onClose }) {
               background: COLORS.bg, borderLeft: `3px solid ${COLORS.gold}`,
               padding: '10px 14px', borderRadius: 4,
             }}>
+              <div style={{
+                fontSize: 10, letterSpacing: 1.5, color: COLORS.gold,
+                fontFamily: 'Cinzel, serif', fontWeight: 600, marginBottom: 6,
+              }}>HABILIDAD ESPECIAL</div>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4, flexWrap: 'wrap', gap: 6 }}>
                 <div style={{
                   fontFamily: 'Cinzel, serif', fontSize: 14, fontWeight: 600,
@@ -1405,7 +1381,6 @@ function JugarTab({ multiplayer = null }) {
   // === MULTIPLAYER CONTEXT ===
   const myColor = multiplayer ? multiplayer.game.color : 'gold';
   const oppColor = myColor === 'gold' ? 'crimson' : 'gold';
-  const applyingRemoteRef = useRef(0); // contador: > 0 cuando se está aplicando una acción del rival
   const isLocalTurn = (color) => color === myColor;
 
   // === VISTA: tablero volteado para el jugador Carmesí en multiplayer ===
@@ -1452,22 +1427,44 @@ function JugarTab({ multiplayer = null }) {
   const cooldownsRef = useRef(cooldowns);
   const oncePerGameRef = useRef(oncePerGame);
   const turnNumberRef = useRef(turnNumber);
+  const turnRef = useRef(turn);
   useEffect(() => { piecesRef.current = pieces; }, [pieces]);
   useEffect(() => { cooldownsRef.current = cooldowns; }, [cooldowns]);
   useEffect(() => { oncePerGameRef.current = oncePerGame; }, [oncePerGame]);
   useEffect(() => { turnNumberRef.current = turnNumber; }, [turnNumber]);
+  useEffect(() => { turnRef.current = turn; }, [turn]);
+
+  // === AUDIO: pausar/reanudar al minimizar la app ===
+  // Evita que el reverb del ambient siga colgado distorsionado en background,
+  // y que sonidos del juego suenen mal al volver.
+  useEffect(() => {
+    function onVisibilityChange() {
+      try {
+        if (!Tone || !Tone.context) return;
+        if (document.visibilityState === 'hidden') {
+          Tone.context.suspend();
+        } else if (document.visibilityState === 'visible') {
+          Tone.context.resume();
+        }
+      } catch (_) {}
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, []);
 
   // === MULTIPLAYER: envío y recepción de acciones ===
+  // Modelo nuevo (sin candado por tiempo):
+  //  - sendIfLocal solo envía cuando es MI turno (turnRef === myColor).
+  //    Esto evita reenviar acciones que llegaron del rival (durante su turno).
+  //  - Cada mensaje lleva un sello "_tn" (número de turno). El receptor descarta
+  //    mensajes cuyo _tn no coincide con su turnNumber actual (duplicados,
+  //    fuera de orden, o desincronizados — ej. tras minimizar la app).
   function sendIfLocal(action) {
     if (!multiplayer) return;
-    if (applyingRemoteRef.current > 0) return; // estoy aplicando una acción remota, no reenviar
-    try { multiplayer.sendMove(action); } catch (_) {}
-  }
-
-  function beginRemote() {
-    applyingRemoteRef.current++;
-    // libera tras la animación + un colchón
-    setTimeout(() => { applyingRemoteRef.current = Math.max(0, applyingRemoteRef.current - 1); }, ANIM_MS + 1200);
+    if (turnRef.current !== myColor) return; // no es mi turno → no envío (evita loop con remoto)
+    try {
+      multiplayer.sendMove({ ...action, _tn: turnNumberRef.current });
+    } catch (_) {}
   }
 
   const board = useMemo(() => computeBoard(pieces), [pieces]);
@@ -1519,8 +1516,14 @@ function JugarTab({ multiplayer = null }) {
   function endTurn(justMovedColor) {
     decrementCooldowns(justMovedColor);
     setActiveAbility(null);
+    const nextTurn = justMovedColor === 'gold' ? 'crimson' : 'gold';
     setTurnNumber(prev => prev + 1);
-    setTurn(justMovedColor === 'gold' ? 'crimson' : 'gold');
+    setTurn(nextTurn);
+    // Mantener refs sincronizados de inmediato (sin esperar al re-render)
+    // así sendIfLocal y validaciones de turnNumber funcionan correctamente
+    // dentro del mismo tick.
+    turnRef.current = nextTurn;
+    turnNumberRef.current = (turnNumberRef.current || 0) + 1;
   }
 
   function executeMove(pieceId, toRow, toCol, isAbility = false, abilityLabel = null) {
@@ -1606,13 +1609,33 @@ function JugarTab({ multiplayer = null }) {
         return;
       }
       // Pending Jinete (after first move of doble galope)
-      if (pendingJinete && pendingJinete.pieceId === pieceId && pendingJinete.phase === 'first') {
+      // FIX desync multiplayer del 2° galope:
+      // Antes leíamos el state `pendingJinete` dentro de este setTimeout, pero el
+      // closure se queda con el valor del render donde se programó el timer.
+      // En el lado del rival, applyRemoteAction hace setPendingJinete({phase:'first'})
+      // y JUSTO DESPUÉS llama executeMove en el mismo handler — sin re-render entre
+      // medio. Entonces el closure veía pendingJinete = null, no entraba al if, y
+      // ejecutaba endTurn(piece.color) automáticamente terminando el turno antes
+      // de tiempo. Como el rival ya había "pasado" el turno, cuando llegaba el 2°
+      // movimiento la validación anti-desync lo descartaba con "no es turno del rival".
+      // Solución: detectar el galope por `abilityLabel` (parámetro local de
+      // executeMove, siempre actualizado) en vez del state stale. Y preservar
+      // `aiMode` usando el callback form de setState.
+      if (abilityLabel === 'Doble Galope (1°)') {
         const newBoard = computeBoard(newPieces);
         const nextMoves = getRawMoves(newBoard, toRow, toCol);
         if (nextMoves.length > 0) {
-          setPendingJinete({ pieceId, phase: 'second' });
-          setSelectedId(pieceId);
-          setHighlights(nextMoves);
+          setPendingJinete(prev => ({
+            pieceId,
+            phase: 'second',
+            ...(prev && prev.aiMode ? { aiMode: true } : {})
+          }));
+          // Solo mostrar highlights al jugador que controla la pieza
+          // (en online, el rival no debe ver highlights sobre la pieza enemiga)
+          if (piece.color === myColor) {
+            setSelectedId(pieceId);
+            setHighlights(nextMoves);
+          }
           return;
         }
       }
@@ -1848,7 +1871,9 @@ function JugarTab({ multiplayer = null }) {
     if (pendingJinete && pendingJinete.phase === 'second' && !pendingJinete.aiMode) {
       const isMove = highlights.some(([nr,nc]) => nr===r && nc===c);
       if (isMove) {
-        executeMove(pendingJinete.pieceId, r, c);
+        // FIX desync: el 2° galope se enviaba sin label, ahora va marcado
+        // igual que lo hace la IA (línea 1840).
+        executeMove(pendingJinete.pieceId, r, c, true, 'Doble Galope (2°)');
         return;
       }
       setPendingJinete(null);
@@ -1880,7 +1905,18 @@ function JugarTab({ multiplayer = null }) {
       }
       const isMove = highlights.some(([nr,nc]) => nr===r && nc===c);
       if (isMove) {
-        executeMove(sel.id, r, c);
+        // ⚠️ FIX desync multiplayer + balance:
+        // El primer movimiento de Doble Galope se ejecutaba como movimiento normal
+        // (sin label), entonces el rival no sabía que era una habilidad y daba
+        // por terminado el turno → ambos clientes se desincronizaban.
+        // Además, el cooldown del Jinete nunca se seteaba localmente (el jugador
+        // podía usar Doble Galope sin restricción).
+        if (activeAbility === 'jinete' && pendingJinete && pendingJinete.phase === 'first') {
+          setCooldowns(prev => ({ ...prev, [myColor]: { ...prev[myColor], jinete: 9 }}));
+          executeMove(sel.id, r, c, true, 'Doble Galope (1°)');
+        } else {
+          executeMove(sel.id, r, c);
+        }
         return;
       }
       if (piece && piece.color === myColor) {
@@ -1920,7 +1956,8 @@ function JugarTab({ multiplayer = null }) {
         const nr = r+dr*2, nc = c+dc*2;
         if (inBounds(nr,nc)) {
           const tgt = board[nr][nc];
-          if (!tgt || tgt.color !== 'gold') targets.push([nr,nc]);
+          // FIX: usar myColor (no 'gold' hardcodeado) para no bloquear al jugador Carmesí
+          if (!tgt || tgt.color !== myColor) targets.push([nr,nc]);
         }
       }
       if (targets.length === 0) return;
@@ -1930,7 +1967,8 @@ function JugarTab({ multiplayer = null }) {
       for (let dr=-3; dr<=3; dr++) for (let dc=-3; dc<=3; dc++) {
         if (dr===0 && dc===0) continue;
         const nr = r+dr, nc = c+dc;
-        if (inBounds(nr,nc) && board[nr][nc] && board[nr][nc].color === 'crimson') {
+        // FIX: apuntar a piezas del oponente (oppColor), no a 'crimson' fijo
+        if (inBounds(nr,nc) && board[nr][nc] && board[nr][nc].color === oppColor) {
           targets.push([nr,nc]);
         }
       }
@@ -1940,7 +1978,8 @@ function JugarTab({ multiplayer = null }) {
       const targets = [];
       for (const [dr,dc] of DIR8) {
         const nr = r+dr, nc = c+dc;
-        if (inBounds(nr,nc) && board[nr][nc] && board[nr][nc].color === 'crimson') {
+        // FIX: apuntar a piezas del oponente (oppColor), no a 'crimson' fijo
+        if (inBounds(nr,nc) && board[nr][nc] && board[nr][nc].color === oppColor) {
           targets.push([nr,nc]);
         }
       }
@@ -1961,7 +2000,8 @@ function JugarTab({ multiplayer = null }) {
           const nr = r+dr*i, nc = c+dc*i;
           if (!inBounds(nr,nc)) break;
           if (board[nr][nc]) {
-            if (board[nr][nc].color !== 'gold') targets.push([nr,nc]);
+            // FIX: usar myColor (no 'gold' hardcodeado) para no bloquear al jugador Carmesí
+            if (board[nr][nc].color !== myColor) targets.push([nr,nc]);
             break;
           }
           targets.push([nr,nc]);
@@ -2003,9 +2043,10 @@ function JugarTab({ multiplayer = null }) {
       setOncePerGame(prev => ({ ...prev, [myColor]: { ...prev[myColor], monarca: true }}));
       executeMove(piece.id, tr, tc, true, 'Salto Real');
     } else if (type === 'hechicera') {
-      playAbility('hechicera');
       const targetP = piecesRef.current.find(p => !p.captured && p.row === tr && p.col === tc);
-      if (!targetP) return;
+      // SAFETY: no permitir auto-captura (defensa contra bug de targeting)
+      if (!targetP || targetP.color === myColor) return;
+      playAbility('hechicera');
       sendIfLocal({ kind: 'spell', abilityKey: 'hechicera', attackerId: piece.id, victimId: targetP.id, cooldownVal: 7, abilityLabel: 'Hechizo Letal' });
       setAnimating(true);
       const newPieces = piecesRef.current.map(p =>
@@ -2025,9 +2066,10 @@ function JugarTab({ multiplayer = null }) {
       }, ANIM_MS);
       setSelectedId(null); setHighlights([]); setAbilityTargets([]); setActiveAbility(null);
     } else if (type === 'fortaleza') {
-      playAbility('fortaleza');
       const targetP = piecesRef.current.find(p => !p.captured && p.row === tr && p.col === tc);
-      if (!targetP) return;
+      // SAFETY: no permitir auto-captura (defensa contra bug de targeting)
+      if (!targetP || targetP.color === myColor) return;
+      playAbility('fortaleza');
       sendIfLocal({ kind: 'spell', abilityKey: 'fortaleza', attackerId: piece.id, victimId: targetP.id, cooldownVal: 6, abilityLabel: 'Aplastar' });
       setAnimating(true);
       const newPieces = piecesRef.current.map(p =>
@@ -2085,7 +2127,23 @@ function JugarTab({ multiplayer = null }) {
   // === MULTIPLAYER: aplicar acciones recibidas del rival ===
   function applyRemoteAction(action) {
     if (!action || !action.kind) return;
-    beginRemote();
+
+    // === VALIDACIONES ANTI-DESYNC ===
+    // 1) El sello de turno debe coincidir con nuestro turnNumber actual.
+    //    Si no coincide, es un mensaje duplicado, viejo, o llegó tras una
+    //    desincronización (ej: la app estuvo minimizada). Lo descartamos.
+    if (typeof action._tn === 'number' && action._tn !== turnNumberRef.current) {
+      // eslint-disable-next-line no-console
+      console.warn('[mp] descartado por turn mismatch', action._tn, '!=', turnNumberRef.current, action.kind);
+      return;
+    }
+    // 2) Solo aceptamos acciones del rival cuando es SU turno.
+    //    Si por algún motivo es nuestro turno, no aplicamos.
+    if (turnRef.current === myColor) {
+      // eslint-disable-next-line no-console
+      console.warn('[mp] descartado: no es turno del rival', action.kind);
+      return;
+    }
 
     switch (action.kind) {
       case 'move': {
@@ -2102,6 +2160,11 @@ function JugarTab({ multiplayer = null }) {
           setCooldowns(prev => ({ ...prev, [oppColor]: { ...prev[oppColor], caballero: 6 }}));
         } else if (action.abilityLabel === 'Salto Real') {
           setOncePerGame(prev => ({ ...prev, [oppColor]: { ...prev[oppColor], monarca: true }}));
+        } else if (action.abilityLabel === 'Doble Galope (1°)') {
+          // FIX: faltaba setear el cooldown del Jinete del rival al recibir
+          // su primer galope. Sin esto, ambos clientes quedaban con
+          // cooldowns distintos para el Jinete.
+          setCooldowns(prev => ({ ...prev, [oppColor]: { ...prev[oppColor], jinete: 9 }}));
         }
         break;
       }
@@ -2116,7 +2179,11 @@ function JugarTab({ multiplayer = null }) {
         // Hechizo Letal / Aplastar — captura sin moverse
         const attacker = piecesRef.current.find(p => p.id === action.attackerId);
         const victim = piecesRef.current.find(p => p.id === action.victimId);
-        if (!attacker || !victim) { applyingRemoteRef.current = Math.max(0, applyingRemoteRef.current - 1); return; }
+        if (!attacker || !victim) {
+          // eslint-disable-next-line no-console
+          console.warn('[mp] spell descartado: pieza no encontrada', action);
+          return;
+        }
         playAbility(attacker.type);
         setAnimating(true);
         const newPieces = piecesRef.current.map(p =>
@@ -2455,6 +2522,14 @@ function JugarTab({ multiplayer = null }) {
                 {PIECE_DATA[selectedPiece.type].movement}
               </div>
             </div>
+          </div>
+          {/* Header sección habilidad especial */}
+          <div style={{
+            fontFamily: 'Cinzel, serif', fontSize: 10, letterSpacing: 2,
+            color: COLORS.gold, marginTop: 4, marginBottom: 6,
+            borderTop: `1px solid ${COLORS.goldDeep}44`, paddingTop: 8,
+          }}>
+            HABILIDAD ESPECIAL
           </div>
           <button
             onClick={activateAbility}
