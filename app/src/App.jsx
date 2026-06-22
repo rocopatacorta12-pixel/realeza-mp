@@ -40,7 +40,7 @@ function MainMenu({ onPickIA, onPickOnline }) {
         <div style={{
           fontFamily: 'Cinzel, serif', fontSize: 11, letterSpacing: 4,
           color: COLORS.gold, marginBottom: 2,
-        }}>UN JUEGO DE 9×9 — V4</div>
+        }}>UN JUEGO DE 9×9 — V5</div>
         <h1 style={{
           fontFamily: 'Cinzel, serif', fontSize: 44, fontWeight: 700,
           letterSpacing: 8, color: COLORS.ink, margin: 0,
