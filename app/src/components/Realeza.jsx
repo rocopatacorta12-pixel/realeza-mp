@@ -772,6 +772,30 @@ function getBaseAudio(name) {
   sfxCache.set(name, a);
   return a;
 }
+// En mobile (Android WebView/Capacitor), los <audio> arrancan "bloqueados" hasta
+// que se reproducen una vez dentro de un gesto del usuario. El RECEPTOR de una
+// jugada online no tiene un gesto en ese instante, así que algunos sonidos no
+// sonaban (de forma aparentemente aleatoria). Para evitarlo, en el primer gesto
+// "desbloqueamos" todos los mp3 reproduciéndolos en silencio una vez.
+let sfxUnlocked = false;
+function unlockSfx() {
+  if (sfxUnlocked) return;
+  sfxUnlocked = true;
+  SFX_NAMES.forEach(n => {
+    try {
+      const base = getBaseAudio(n);
+      base.muted = true;
+      const p = base.play();
+      if (p && typeof p.then === 'function') {
+        p.then(() => {
+          try { base.pause(); base.currentTime = 0; base.muted = false; } catch (_) {}
+        }).catch(() => { base.muted = false; });
+      } else {
+        base.muted = false;
+      }
+    } catch (_) {}
+  });
+}
 function playSfx(name, volume = 0.9) {
   if (!soundConfig.effects) return;
   try {
@@ -779,7 +803,17 @@ function playSfx(name, volume = 0.9) {
     const inst = base.cloneNode();
     inst.volume = volume;
     const p = inst.play();
-    if (p && typeof p.catch === 'function') p.catch(() => {});
+    if (p && typeof p.catch === 'function') {
+      p.catch(() => {
+        // Reintento defensivo: si falló por bloqueo, intentar sobre el base.
+        try {
+          base.currentTime = 0;
+          base.volume = volume;
+          const p2 = base.play();
+          if (p2 && typeof p2.catch === 'function') p2.catch(() => {});
+        } catch (_) {}
+      });
+    }
   } catch (_) {}
 }
 // Lista de todos los nombres (sin extensión) — usado para precarga.
@@ -802,6 +836,8 @@ function preloadSfx() {
 async function ensureAudio() {
   // Precargar los mp3 en el primer gesto del usuario (mobile-friendly).
   preloadSfx();
+  // Desbloquear los mp3 (necesario en Android para que suenen al RECIBIR jugadas).
+  unlockSfx();
   if (!audioStarted) {
     try {
       await Tone.start();
@@ -1600,11 +1636,31 @@ function JugarTab({ multiplayer = null }) {
   const turnRef = useRef(turn);
   // Memoria de la IA: cuántas habilidades usó en la partida (para el tope por nivel).
   const aiAbilitiesUsedRef = useRef(0);
+  // Dedup de acciones remotas (último _tn que cerró turno ya procesado).
+  const lastRemoteTnRef = useRef(-1);
   useEffect(() => { piecesRef.current = pieces; }, [pieces]);
   useEffect(() => { cooldownsRef.current = cooldowns; }, [cooldowns]);
   useEffect(() => { oncePerGameRef.current = oncePerGame; }, [oncePerGame]);
   useEffect(() => { turnNumberRef.current = turnNumber; }, [turnNumber]);
   useEffect(() => { turnRef.current = turn; }, [turn]);
+
+  // === v11: SINCRONIZACIÓN DE TURNO DESDE EL SERVIDOR (autoritativo) ===
+  // En multiplayer, el servidor es el dueño del turno. Cada vez que cambia
+  // serverTurn, alineamos el estado local (turn + turnNumber) con él.
+  // Esto elimina por completo el bug de "jugar solo": ya no hay dos contadores
+  // independientes que puedan divergir, hay UNO solo que vive en el servidor.
+  const serverTurn = multiplayer ? multiplayer.serverTurn : null;
+  useEffect(() => {
+    if (!multiplayer || !serverTurn) return;
+    if (typeof serverTurn.currentTurn === 'string') {
+      setTurn(serverTurn.currentTurn);
+      turnRef.current = serverTurn.currentTurn;
+    }
+    if (typeof serverTurn.turnNumber === 'number') {
+      setTurnNumber(serverTurn.turnNumber);
+      turnNumberRef.current = serverTurn.turnNumber;
+    }
+  }, [multiplayer, serverTurn]);
 
   // === AUDIO: pausar/reanudar al minimizar la app ===
   // Evita que el reverb del ambient siga colgado distorsionado en background,
@@ -1631,11 +1687,18 @@ function JugarTab({ multiplayer = null }) {
   //  - Cada mensaje lleva un sello "_tn" (número de turno). El receptor descarta
   //    mensajes cuyo _tn no coincide con su turnNumber actual (duplicados,
   //    fuera de orden, o desincronizados — ej. tras minimizar la app).
-  function sendIfLocal(action) {
+  // === MULTIPLAYER v11: envío de acciones al SERVIDOR ===
+  // Ya no llevamos sello de turno local; el servidor sella _tn y valida el turno.
+  // sendIfLocal solo envía cuando es MI turno (defensa local), pero la autoridad
+  // real la tiene el servidor: si llegara fuera de turno, lo rebota con
+  // 'action_rejected' y nos resincroniza.
+  //   turnEnds: por defecto true. Solo el 1er movimiento de Doble Galope pasa
+  //   turnEnds:false (no termina el turno, viene un 2° galope).
+  function sendIfLocal(action, turnEnds = true) {
     if (!multiplayer) return;
-    if (turnRef.current !== myColor) return; // no es mi turno → no envío (evita loop con remoto)
+    if (turnRef.current !== myColor) return;
     try {
-      multiplayer.sendMove({ ...action, _tn: turnNumberRef.current });
+      multiplayer.sendAction({ ...action, turnEnds });
     } catch (_) {}
   }
 
@@ -1662,6 +1725,7 @@ function JugarTab({ multiplayer = null }) {
     setAnimating(false);
     setTurnNumber(0);
     aiAbilitiesUsedRef.current = 0;
+    lastRemoteTnRef.current = -1;
   }
 
   const selectedPiece = selectedId ? pieces.find(p => p.id === selectedId && !p.captured) : null;
@@ -1689,12 +1753,14 @@ function JugarTab({ multiplayer = null }) {
   function endTurn(justMovedColor) {
     decrementCooldowns(justMovedColor);
     setActiveAbility(null);
+    // v11: en MULTIPLAYER el servidor es el dueño del turno. NO avanzamos el
+    // turno ni el turnNumber localmente — llegará vía 'turn_state' y el efecto
+    // de sincronización lo aplicará. Avanzarlo acá causaría doble-conteo y la
+    // vieja divergencia. En modo IA (sin multiplayer) sí avanzamos local.
+    if (multiplayer) return;
     const nextTurn = justMovedColor === 'gold' ? 'crimson' : 'gold';
     setTurnNumber(prev => prev + 1);
     setTurn(nextTurn);
-    // Mantener refs sincronizados de inmediato (sin esperar al re-render)
-    // así sendIfLocal y validaciones de turnNumber funcionan correctamente
-    // dentro del mismo tick.
     turnRef.current = nextTurn;
     turnNumberRef.current = (turnNumberRef.current || 0) + 1;
   }
@@ -1709,13 +1775,15 @@ function JugarTab({ multiplayer = null }) {
     let galopePhase = null;
     if (abilityLabel === 'Doble Galope (1°)') galopePhase = 'first';
     else if (abilityLabel === 'Doble Galope (2°)') galopePhase = 'second';
+    // El 1er movimiento de Doble Galope NO termina el turno (viene un 2°).
+    const movEndsTurn = galopePhase !== 'first';
     sendIfLocal({
       kind: 'move',
       pieceId, toRow, toCol,
       isAbility: !!isAbility,
       abilityLabel: abilityLabel || null,
       galopePhase,
-    });
+    }, movEndsTurn);
 
     if (isAbility && abilityLabel) {
       // Ability-based move (Embestida, Salto Real)
@@ -2039,6 +2107,20 @@ function JugarTab({ multiplayer = null }) {
 
   // === PLAYER CLICK HANDLERS ===
 
+  // Limpia TODO el estado de selección/habilidad. Se usa cada vez que el jugador
+  // se "arrepiente" (toca otra pieza, toca fuera, etc.). v11 FIX: antes, al tocar
+  // otra pieza mientras el Jinete tenía Doble Galope activado (o cualquier
+  // habilidad en proceso de targeting), quedaban activeAbility/pendingJinete
+  // colgados. Esos estados zombis hacían que la siguiente habilidad pareciera
+  // "ya usada / desactivada". Ahora se limpian siempre.
+  function clearSelectionAndAbility() {
+    setSelectedId(null);
+    setHighlights([]);
+    setActiveAbility(null);
+    setAbilityTargets([]);
+    setPendingJinete(null);
+  }
+
   function onSquareClick(r, c) {
     ensureAudio();
     if (winner || turn !== myColor || aiThinking || animating || promotionPick) return;
@@ -2046,8 +2128,6 @@ function JugarTab({ multiplayer = null }) {
     if (pendingJinete && pendingJinete.phase === 'second' && !pendingJinete.aiMode) {
       const isMove = highlights.some(([nr,nc]) => nr===r && nc===c);
       if (isMove) {
-        // FIX desync: el 2° galope se enviaba sin label, ahora va marcado
-        // igual que lo hace la IA (línea 1840).
         executeMove(pendingJinete.pieceId, r, c, true, 'Doble Galope (2°)');
         return;
       }
@@ -2065,42 +2145,62 @@ function JugarTab({ multiplayer = null }) {
         executePlayerAbility(r, c);
         return;
       }
-      setActiveAbility(null); setAbilityTargets([]);
-      setSelectedId(null); setHighlights([]);
+      // Se arrepintió de la habilidad de targeting: limpiar TODO.
+      clearSelectionAndAbility();
       return;
     }
 
     const piece = board[r][c];
 
-    if (selectedId) {
-      const sel = pieces.find(p => p.id === selectedId);
-      if (!sel) { setSelectedId(null); setHighlights([]); return; }
-      if (sel.row === r && sel.col === c) {
-        setSelectedId(null); setHighlights([]); return;
-      }
+    // CASO ESPECIAL: Doble Galope activado en fase 'first' (esperando el 1er
+    // movimiento). El estado vive en activeAbility==='jinete' + pendingJinete.
+    // Si toca una casilla de movimiento válida → ejecuta el 1er galope.
+    // Si toca CUALQUIER OTRA cosa (otra pieza, casilla vacía, la misma pieza) →
+    // cancela el Doble Galope limpiando el estado (FIX del bug "se arrepintió").
+    if (activeAbility === 'jinete' && pendingJinete && pendingJinete.phase === 'first') {
       const isMove = highlights.some(([nr,nc]) => nr===r && nc===c);
       if (isMove) {
-        // ⚠️ FIX desync multiplayer + balance:
-        // El primer movimiento de Doble Galope se ejecutaba como movimiento normal
-        // (sin label), entonces el rival no sabía que era una habilidad y daba
-        // por terminado el turno → ambos clientes se desincronizaban.
-        // Además, el cooldown del Jinete nunca se seteaba localmente (el jugador
-        // podía usar Doble Galope sin restricción).
-        if (activeAbility === 'jinete' && pendingJinete && pendingJinete.phase === 'first') {
+        const sel = pieces.find(p => p.id === selectedId);
+        if (sel) {
           setCooldowns(prev => ({ ...prev, [myColor]: { ...prev[myColor], jinete: 9 }}));
           executeMove(sel.id, r, c, true, 'Doble Galope (1°)');
-        } else {
-          executeMove(sel.id, r, c);
         }
         return;
       }
+      // Cancelar el Doble Galope. Si tocó otra pieza propia, la seleccionamos.
+      clearSelectionAndAbility();
       if (piece && piece.color === myColor) {
+        setSelectedId(piece.id);
+        setHighlights(getRawMoves(board, r, c));
+        playSelect();
+      }
+      return;
+    }
+
+    if (selectedId) {
+      const sel = pieces.find(p => p.id === selectedId);
+      if (!sel) { clearSelectionAndAbility(); return; }
+      if (sel.row === r && sel.col === c) {
+        // Tocó la misma pieza: deseleccionar y limpiar cualquier habilidad pendiente.
+        clearSelectionAndAbility();
+        return;
+      }
+      const isMove = highlights.some(([nr,nc]) => nr===r && nc===c);
+      if (isMove) {
+        executeMove(sel.id, r, c);
+        return;
+      }
+      if (piece && piece.color === myColor) {
+        // Cambió de pieza: limpiar habilidad pendiente antes de seleccionar la nueva.
+        setActiveAbility(null);
+        setAbilityTargets([]);
+        setPendingJinete(null);
         setSelectedId(piece.id);
         setHighlights(getRawMoves(board, r, c));
         playSelect();
         return;
       }
-      setSelectedId(null); setHighlights([]);
+      clearSelectionAndAbility();
       return;
     }
 
@@ -2303,21 +2403,21 @@ function JugarTab({ multiplayer = null }) {
   function applyRemoteAction(action) {
     if (!action || !action.kind) return;
 
-    // === VALIDACIONES ANTI-DESYNC ===
-    // 1) El sello de turno debe coincidir con nuestro turnNumber actual.
-    //    Si no coincide, es un mensaje duplicado, viejo, o llegó tras una
-    //    desincronización (ej: la app estuvo minimizada). Lo descartamos.
-    if (typeof action._tn === 'number' && action._tn !== turnNumberRef.current) {
-      // eslint-disable-next-line no-console
-      console.warn('[mp] descartado por turn mismatch', action._tn, '!=', turnNumberRef.current, action.kind);
-      return;
-    }
-    // 2) Solo aceptamos acciones del rival cuando es SU turno.
-    //    Si por algún motivo es nuestro turno, no aplicamos.
-    if (turnRef.current === myColor) {
-      // eslint-disable-next-line no-console
-      console.warn('[mp] descartado: no es turno del rival', action.kind);
-      return;
+    // v11: el SERVIDOR ya validó que esta acción corresponde al turno del rival.
+    // Si llegó hasta acá, es legítima. Ya NO la descartamos por mismatch de turno
+    // local (eso era justamente lo que congelaba a un jugador para siempre).
+    //
+    // Solo hacemos deduplicación: si el server reenviara un duplicado exacto
+    // (mismo _tn de una acción que cierra turno), lo ignoramos. Las sub-fases que
+    // NO cierran turno (1er Doble Galope: turnEnds===false) NO se deduplican por
+    // _tn porque comparten número con la fase siguiente.
+    const closesTurn = action.turnEnds !== false;
+    if (closesTurn && typeof action._tn === 'number') {
+      if (action._tn === lastRemoteTnRef.current) {
+        console.warn('[mp] duplicado ignorado _tn=', action._tn, action.kind);
+        return;
+      }
+      lastRemoteTnRef.current = action._tn;
     }
 
     switch (action.kind) {
@@ -2336,9 +2436,6 @@ function JugarTab({ multiplayer = null }) {
         } else if (action.abilityLabel === 'Salto Real') {
           setOncePerGame(prev => ({ ...prev, [oppColor]: { ...prev[oppColor], monarca: true }}));
         } else if (action.abilityLabel === 'Doble Galope (1°)') {
-          // FIX: faltaba setear el cooldown del Jinete del rival al recibir
-          // su primer galope. Sin esto, ambos clientes quedaban con
-          // cooldowns distintos para el Jinete.
           setCooldowns(prev => ({ ...prev, [oppColor]: { ...prev[oppColor], jinete: 9 }}));
         }
         break;
@@ -2414,7 +2511,33 @@ function JugarTab({ multiplayer = null }) {
   useEffect(() => {
     if (!multiplayer || !multiplayer.setRemoteHandler) return;
     multiplayer.setRemoteHandler((action) => applyRemoteRef.current(action));
-    return () => { multiplayer.setRemoteHandler(() => {}); };
+    // Si el servidor rechaza una acción nuestra (llegó fuera de turno), limpiamos
+    // cualquier selección/animación pendiente. El turno correcto ya viene en
+    // serverTurn y el efecto de sincronización lo aplica.
+    if (multiplayer.setRejectHandler) {
+      multiplayer.setRejectHandler(() => {
+        setSelectedId(null); setHighlights([]);
+        setActiveAbility(null); setAbilityTargets([]);
+        setPendingJinete(null);
+      });
+    }
+    return () => {
+      multiplayer.setRemoteHandler(() => {});
+      if (multiplayer.setRejectHandler) multiplayer.setRejectHandler(() => {});
+    };
+  }, [multiplayer]);
+
+  // v11: al volver de background (o cada tanto), pedir el estado de turno
+  // autoritativo al servidor para resincronizar por las dudas.
+  useEffect(() => {
+    if (!multiplayer || !multiplayer.requestTurnState) return;
+    function onVis() {
+      if (document.visibilityState === 'visible') {
+        try { multiplayer.requestTurnState(); } catch (_) {}
+      }
+    }
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
   }, [multiplayer]);
 
   const boardSize = cellSize * BOARD_SIZE;
@@ -2452,6 +2575,18 @@ function JugarTab({ multiplayer = null }) {
               }}>SALIR</button>
             )}
           </div>
+          {/* Indicador de turno (v11): siempre claro de quién es el turno */}
+          {!winner && (
+            <div style={{
+              marginTop: 8, padding: '6px 10px', borderRadius: 6, textAlign: 'center',
+              fontFamily: 'Cinzel, serif', fontSize: 12, letterSpacing: 1, fontWeight: 600,
+              background: turn === myColor ? COLORS.gold : COLORS.cardLight,
+              color: turn === myColor ? '#1A1410' : COLORS.inkMute,
+              border: `1px solid ${turn === myColor ? COLORS.gold : COLORS.goldDeep + '44'}`,
+            }}>
+              {turn === myColor ? '➤ ES TU TURNO' : `Esperando a ${multiplayer.game.opponentName}…`}
+            </div>
+          )}
         </div>
       )}
 

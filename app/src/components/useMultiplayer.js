@@ -2,32 +2,32 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { io } from 'socket.io-client';
 
 /**
- * Hook de multiplayer.
+ * Hook de multiplayer — v11.
+ *
+ * NOVEDAD v11: el TURNO es autoritativo del servidor.
+ *   - El servidor lleva currentTurn/turnNumber y los confirma vía 'turn_state'.
+ *   - El cliente NO decide el turno por su cuenta; lo lee de serverTurn.
+ *   - sendAction() envia la accion al servidor (evento 'action'); el servidor
+ *     valida turno, sella _tn y reenvia al rival.
+ *   - Si el servidor rechaza ('action_rejected'), el hook resincroniza.
  *
  * Estados expuestos:
- *   - status: 'disconnected' | 'connecting' | 'idle' | 'inviting' | 'in-game'
- *   - myName, mySocketId
- *   - players: [{name, socketId}]
- *   - incomingInvite: { fromName, fromSocketId } | null
- *   - outgoingInvite: { toName } | null
- *   - game: { color, opponentName, gameId } | null
+ *   - status, myName, mySocketId, players, incomingInvite, outgoingInvite, game
+ *   - serverTurn: { currentTurn, turnNumber } | null  (autoritativo)
+ *   - lastError, serverInfo
  *
  * Acciones:
- *   - connect(serverUrl, name)
- *   - disconnect()
- *   - refreshPlayers()
- *   - invite(targetSocketId)
- *   - accept(fromSocketId)
- *   - decline(fromSocketId)
- *   - sendMove(payload)   // envía el evento al rival
+ *   - connect, disconnect, refreshPlayers, invite, accept, decline
+ *   - sendAction(payload)     // envia accion de juego al servidor
+ *   - requestTurnState()      // pide resync del turno
  *   - leaveGame()
- *
- * Callback de mensajes del rival: pasar onRemoteMove al construir el hook.
+ *   - setRemoteHandler(fn)    // callback para acciones del rival
+ *   - setRejectHandler(fn)    // callback cuando el server rechaza una accion propia
  */
-export function useMultiplayer({ onRemoteMove } = {}) {
+export function useMultiplayer() {
   const socketRef = useRef(null);
-  const onRemoteMoveRef = useRef(onRemoteMove);
-  useEffect(() => { onRemoteMoveRef.current = onRemoteMove; }, [onRemoteMove]);
+  const remoteHandlerRef = useRef(() => {});
+  const rejectHandlerRef = useRef(() => {});
 
   const [status, setStatus] = useState('disconnected');
   const [myName, setMyName] = useState(null);
@@ -36,6 +36,7 @@ export function useMultiplayer({ onRemoteMove } = {}) {
   const [incomingInvite, setIncomingInvite] = useState(null);
   const [outgoingInvite, setOutgoingInvite] = useState(null);
   const [game, setGame] = useState(null);
+  const [serverTurn, setServerTurn] = useState(null);
   const [lastError, setLastError] = useState(null);
   const [serverInfo, setServerInfo] = useState(null);
 
@@ -50,7 +51,7 @@ export function useMultiplayer({ onRemoteMove } = {}) {
     const s = io(serverUrl, {
       transports: ['websocket', 'polling'],
       reconnection: true,
-      reconnectionAttempts: 5,
+      reconnectionAttempts: 10,
       reconnectionDelay: 1000,
       timeout: 8000,
     });
@@ -86,13 +87,13 @@ export function useMultiplayer({ onRemoteMove } = {}) {
 
     s.on('invite_declined', ({ byName }) => {
       setOutgoingInvite(null);
-      setLastError(`${byName} rechazó la invitación`);
+      setLastError(`${byName} rechazo la invitacion`);
       setStatus('idle');
     });
 
     s.on('invite_error', ({ reason }) => {
       setOutgoingInvite(null);
-      setLastError(reason || 'Error de invitación');
+      setLastError(reason || 'Error de invitacion');
       setStatus('idle');
     });
 
@@ -100,26 +101,49 @@ export function useMultiplayer({ onRemoteMove } = {}) {
       setOutgoingInvite(null);
       setIncomingInvite(null);
       setGame({ gameId, color, opponentName });
+      // gold arranca; turnNumber 0 (lo confirmara el servidor igual).
+      setServerTurn({ currentTurn: 'gold', turnNumber: 0 });
       setStatus('in-game');
     });
 
-    s.on('move', (payload) => {
-      if (onRemoteMoveRef.current) {
-        onRemoteMoveRef.current(payload);
+    // Accion del rival (ya validada y sellada por el servidor).
+    s.on('action', (payload) => {
+      remoteHandlerRef.current(payload);
+    });
+
+    // Estado de turno autoritativo (tras cada accion o tras request).
+    s.on('turn_state', (ts) => {
+      if (ts && typeof ts.currentTurn === 'string') {
+        setServerTurn({ currentTurn: ts.currentTurn, turnNumber: ts.turnNumber });
       }
+    });
+
+    // El servidor rechazo una accion propia (llego fuera de turno).
+    s.on('action_rejected', (info) => {
+      if (info && typeof info.currentTurn === 'string') {
+        setServerTurn({ currentTurn: info.currentTurn, turnNumber: info.turnNumber });
+      }
+      rejectHandlerRef.current(info);
     });
 
     s.on('opponent_left', ({ reason }) => {
       setLastError(reason === 'opponent_disconnected'
-        ? 'El rival se desconectó'
-        : 'El rival abandonó la partida');
+        ? 'El rival se desconecto'
+        : 'El rival abandono la partida');
       setGame(null);
+      setServerTurn(null);
       setStatus('idle');
       if (socketRef.current) socketRef.current.emit('list_players');
     });
 
     s.on('disconnect', () => {
       setStatus('disconnected');
+    });
+
+    // Al reconectar, re-registrar y pedir el estado de turno para resync.
+    s.on('reconnect', () => {
+      s.emit('register', { name });
+      s.emit('request_turn_state');
     });
 
     s.on('connect_error', (err) => {
@@ -135,6 +159,7 @@ export function useMultiplayer({ onRemoteMove } = {}) {
     }
     setStatus('disconnected');
     setGame(null);
+    setServerTurn(null);
     setPlayers([]);
     setIncomingInvite(null);
     setOutgoingInvite(null);
@@ -167,16 +192,30 @@ export function useMultiplayer({ onRemoteMove } = {}) {
     }
   }, []);
 
-  const sendMove = useCallback((payload) => {
+  const sendAction = useCallback((payload) => {
     if (socketRef.current && socketRef.current.connected) {
-      socketRef.current.emit('move', payload);
+      socketRef.current.emit('action', payload);
+    }
+  }, []);
+
+  const requestTurnState = useCallback(() => {
+    if (socketRef.current && socketRef.current.connected) {
+      socketRef.current.emit('request_turn_state');
     }
   }, []);
 
   const leaveGame = useCallback(() => {
     if (socketRef.current) socketRef.current.emit('leave_game');
     setGame(null);
+    setServerTurn(null);
     setStatus('idle');
+  }, []);
+
+  const setRemoteHandler = useCallback((fn) => {
+    remoteHandlerRef.current = typeof fn === 'function' ? fn : (() => {});
+  }, []);
+  const setRejectHandler = useCallback((fn) => {
+    rejectHandlerRef.current = typeof fn === 'function' ? fn : (() => {});
   }, []);
 
   useEffect(() => () => {
@@ -187,8 +226,9 @@ export function useMultiplayer({ onRemoteMove } = {}) {
 
   return {
     status, myName, mySocketId, players, incomingInvite, outgoingInvite, game,
-    lastError, serverInfo,
-    connect, disconnect, refreshPlayers, invite, accept, decline, sendMove, leaveGame,
-    sendMoveFn: sendMove,
+    serverTurn, lastError, serverInfo,
+    connect, disconnect, refreshPlayers, invite, accept, decline,
+    sendAction, requestTurnState, leaveGame,
+    setRemoteHandler, setRejectHandler,
   };
 }

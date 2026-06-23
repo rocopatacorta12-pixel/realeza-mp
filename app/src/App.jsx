@@ -1,11 +1,11 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import Realeza, { JugarTab } from './components/Realeza.jsx';
 import { useMultiplayer } from './components/useMultiplayer.js';
 
 // === CONFIGURACIÓN ===
 // URL del servidor multiplayer. Se persiste en localStorage tras la primera vez.
-// Cambiá el default si querés.
-const DEFAULT_SERVER_URL = 'http://localhost:3001';
+// Default = el servidor de Railway de Rafa (ya desplegado).
+const DEFAULT_SERVER_URL = 'https://realeza-mp-production.up.railway.app';
 
 const COLORS = {
   bg: '#0F1722', card: '#1A2435', cardLight: '#222F44',
@@ -40,7 +40,7 @@ function MainMenu({ onPickIA, onPickOnline }) {
         <div style={{
           fontFamily: 'Cinzel, serif', fontSize: 11, letterSpacing: 4,
           color: COLORS.gold, marginBottom: 2,
-        }}>UN JUEGO DE 9×9 — V5</div>
+        }}>UN JUEGO DE 9×9 — V11</div>
         <h1 style={{
           fontFamily: 'Cinzel, serif', fontSize: 44, fontWeight: 700,
           letterSpacing: 8, color: COLORS.ink, margin: 0,
@@ -68,7 +68,7 @@ function MainMenu({ onPickIA, onPickOnline }) {
       </button>
 
       <div style={{ textAlign: 'center', fontSize: 10, color: COLORS.inkMute, letterSpacing: 1, marginTop: 12 }}>
-        REALEZA · V4 — 2 BALANCE FIXES · MULTIPLAYER
+        REALEZA · V11 — MULTIPLAYER ESTABLE
       </div>
     </div>
   );
@@ -340,11 +340,8 @@ export default function App() {
   // Modos: 'menu' | 'setup_online' | 'lobby' | 'game_ia' | 'game_mp'
   const [mode, setMode] = useState('menu');
 
-  // Handler de movimientos remotos (lo asigna el JugarTab cuando arranca)
-  const remoteHandlerRef = useRef(() => {});
-  const mp = useMultiplayer({
-    onRemoteMove: (payload) => remoteHandlerRef.current(payload),
-  });
+  // v11: el hook gestiona los handlers internamente (setRemoteHandler/setRejectHandler).
+  const mp = useMultiplayer();
 
   // Cuando el server confirma game_start, pasamos al juego
   useEffect(() => {
@@ -391,9 +388,12 @@ export default function App() {
   if (mode === 'game_mp' && mp.game) {
     const multiplayerProps = {
       game: mp.game,
-      sendMove: mp.sendMove,
+      serverTurn: mp.serverTurn,
+      sendAction: mp.sendAction,
+      requestTurnState: mp.requestTurnState,
       leaveGame: () => { mp.leaveGame(); setMode('lobby'); },
-      setRemoteHandler: (fn) => { remoteHandlerRef.current = fn; },
+      setRemoteHandler: mp.setRemoteHandler,
+      setRejectHandler: mp.setRejectHandler,
     };
     return (
       <div style={{
