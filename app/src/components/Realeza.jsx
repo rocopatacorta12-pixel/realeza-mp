@@ -27,14 +27,14 @@ const PIECE_DATA = {
     name: 'Monarca', value: 1000,
     movement: '1 casilla en cualquier dirección.',
     abilityName: 'Salto Real',
-    abilityDesc: 'Salta 2 casillas ortogonales pasando sobre cualquier pieza.',
+    abilityDesc: 'Salta 2 casillas ortogonales pasando sobre cualquier pieza. Si cae sobre una pieza enemiga, la captura.',
     abilityCooldown: '1 vez por partida',
   },
   hechicera: {
     name: 'Hechicera', value: 9,
     movement: 'Cualquier dirección, hasta 5 casillas.',
     abilityName: 'Hechizo Letal',
-    abilityDesc: 'Sin moverse, captura un enemigo hasta 3 casillas en cualquier dirección.',
+    abilityDesc: 'Sin moverse, captura un enemigo hasta 3 casillas en cualquier dirección. No puede capturar al Monarca.',
     abilityCooldown: 'Cada 6 turnos',
   },
   fortaleza: {
@@ -69,7 +69,7 @@ const PIECE_DATA = {
     name: 'Infante', value: 1,
     movement: 'Avanza 1. Captura en diagonal. Al fondo: promueve a Hechicera.',
     abilityName: 'Coronación Anticipada',
-    abilityDesc: 'Se transforma en cualquier pieza (excepto Monarca) en su casilla. Solo disponible en la mitad enemiga del tablero.',
+    abilityDesc: 'Se transforma en cualquier pieza (excepto Monarca) en su casilla. Disponible al llegar a la mitad de la cancha (o la mitad enemiga).',
     abilityCooldown: '1 vez por partida',
   },
 };
@@ -605,7 +605,9 @@ function findAIAbility(board, color, cooldowns, oncePerGame, difficulty, turnNum
         for (let dr=-3; dr<=3; dr++) for (let dc=-3; dc<=3; dc++) {
           if (dr===0 && dc===0) continue;
           const nr = r+dr, nc = c+dc;
-          if (inBounds(nr,nc) && board[nr][nc] && board[nr][nc].color !== color) {
+          // NERF: la Hechicera NO puede capturar al Monarca con su habilidad.
+          if (inBounds(nr,nc) && board[nr][nc] && board[nr][nc].color !== color
+              && board[nr][nc].type !== 'monarca') {
             const val = PIECE_DATA[board[nr][nc].type].value;
             candidates.push({ abilityType:'hechicera', pieceId:p.id, from:[r,c], target:[nr,nc], score: val });
           }
@@ -656,10 +658,10 @@ function findAIAbility(board, color, cooldowns, oncePerGame, difficulty, turnNum
         }
       }
 
-      // Coronación (Infante) - solo si en mitad enemiga (Solución B)
+      // Coronación (Infante) - al llegar a la mitad de la cancha o más (Solución B)
       if (p.type === 'infante' && !used) {
-        // Mitad enemiga: gold filas 0-3, crimson filas 5-8
-        const inEnemyHalf = (color === 'gold' && r <= 3) || (color === 'crimson' && r >= 5);
+        // Mitad de la cancha (fila central = 4): gold filas 0-4, crimson filas 4-8
+        const inEnemyHalf = (color === 'gold' && r <= 4) || (color === 'crimson' && r >= 4);
         if (!inEnemyHalf) continue;
         const distToPromote = color === 'gold' ? r : (BOARD_SIZE - 1 - r);
         // Use if close (within 2 rows) and we can attack from here
@@ -760,10 +762,36 @@ function setAmbient(on) {
 
 // =====================================================================
 // === SFX por archivo mp3 (carpeta /public/sounds, 17 archivos) ===
-// Cacheamos un objeto Audio "base" por nombre y cloneNode() en cada play
-// para permitir que se solapen sin tener que resetear currentTime.
+// Estrategia POOL (HTMLAudio, igual familia que la v11 que SÍ suena en la app,
+// NO Web Audio). Por cada sonido mantenemos varios elementos <audio> creados y
+// CARGADOS una sola vez al inicio, y los "desbloqueamos" en el primer gesto.
+// Después se REUSAN (no creamos elementos nuevos): así siempre están listos y
+// suenan al instante, también al RECIBIR la jugada del rival en online —donde
+// no hay un gesto del usuario—. Esto arregla la intermitencia de la v11, que
+// usaba cloneNode() (creaba un <audio> nuevo cada vez, que a veces no había
+// terminado de cargar → no sonaba, de forma aparentemente aleatoria).
 // Respeta soundConfig.effects (toggle de "Sonidos de piezas").
 // =====================================================================
+const SFX_POOL_SIZE = 3;     // instancias por sonido (para solapamientos del mismo sonido)
+const sfxPool = new Map();   // name -> { els: HTMLAudioElement[], idx: number }
+
+function getSfxPool(name) {
+  let pool = sfxPool.get(name);
+  if (!pool) {
+    const els = [];
+    for (let i = 0; i < SFX_POOL_SIZE; i++) {
+      const a = new Audio(`sounds/${name}.mp3`);
+      a.preload = 'auto';
+      try { a.load(); } catch (_) {}
+      els.push(a);
+    }
+    pool = { els, idx: 0 };
+    sfxPool.set(name, pool);
+  }
+  return pool;
+}
+
+// Compatibilidad: por si algún código viejo pide un Audio "base".
 const sfxCache = new Map();
 function getBaseAudio(name) {
   if (sfxCache.has(name)) return sfxCache.get(name);
@@ -772,51 +800,56 @@ function getBaseAudio(name) {
   sfxCache.set(name, a);
   return a;
 }
-// En mobile (Android WebView/Capacitor), los <audio> arrancan "bloqueados" hasta
-// que se reproducen una vez dentro de un gesto del usuario. El RECEPTOR de una
-// jugada online no tiene un gesto en ese instante, así que algunos sonidos no
-// sonaban (de forma aparentemente aleatoria). Para evitarlo, en el primer gesto
-// "desbloqueamos" todos los mp3 reproduciéndolos en silencio una vez.
+
+// Desbloqueo en el PRIMER gesto del usuario: reproducir+pausar en mudo cada
+// elemento del pool. Una vez desbloqueados, pueden volver a sonar sin gesto.
 let sfxUnlocked = false;
 function unlockSfx() {
   if (sfxUnlocked) return;
   sfxUnlocked = true;
   SFX_NAMES.forEach(n => {
-    try {
-      const base = getBaseAudio(n);
-      base.muted = true;
-      const p = base.play();
-      if (p && typeof p.then === 'function') {
-        p.then(() => {
-          try { base.pause(); base.currentTime = 0; base.muted = false; } catch (_) {}
-        }).catch(() => { base.muted = false; });
-      } else {
-        base.muted = false;
-      }
-    } catch (_) {}
+    const pool = getSfxPool(n);
+    pool.els.forEach(a => {
+      try {
+        a.muted = true;
+        const p = a.play();
+        if (p && typeof p.then === 'function') {
+          p.then(() => { try { a.pause(); a.currentTime = 0; a.muted = false; } catch (_) {} })
+           .catch(() => { try { a.muted = false; } catch (_) {} });
+        } else {
+          try { a.pause(); a.currentTime = 0; } catch (_) {}
+          a.muted = false;
+        }
+      } catch (_) {}
+    });
   });
 }
+
 function playSfx(name, volume = 0.9) {
   if (!soundConfig.effects) return;
   try {
-    const base = getBaseAudio(name);
-    const inst = base.cloneNode();
-    inst.volume = volume;
-    const p = inst.play();
+    const pool = getSfxPool(name);
+    const a = pool.els[pool.idx];
+    pool.idx = (pool.idx + 1) % pool.els.length;
+    try { a.currentTime = 0; } catch (_) {}
+    a.muted = false;
+    a.volume = volume;
+    const p = a.play();
     if (p && typeof p.catch === 'function') {
       p.catch(() => {
-        // Reintento defensivo: si falló por bloqueo, intentar sobre el base.
+        // Respaldo (igual que la v11): un <audio> nuevo por si el del pool falló.
         try {
-          base.currentTime = 0;
-          base.volume = volume;
-          const p2 = base.play();
+          const fresh = new Audio(`sounds/${name}.mp3`);
+          fresh.volume = volume;
+          const p2 = fresh.play();
           if (p2 && typeof p2.catch === 'function') p2.catch(() => {});
         } catch (_) {}
       });
     }
   } catch (_) {}
 }
-// Lista de todos los nombres (sin extensión) — usado para precarga.
+
+// Lista de todos los nombres (sin extensión) — usado para precarga/desbloqueo.
 const SFX_NAMES = [
   'move_monarca','move_hechicera','move_fortaleza','move_druida',
   'move_jinete','move_caballero','move_infante',
@@ -830,7 +863,8 @@ let sfxPreloaded = false;
 function preloadSfx() {
   if (sfxPreloaded) return;
   sfxPreloaded = true;
-  SFX_NAMES.forEach(n => { try { getBaseAudio(n).load(); } catch (_) {} });
+  // Crear y cargar por adelantado los pools de cada sonido (quedan listos).
+  SFX_NAMES.forEach(n => { getSfxPool(n); });
 }
 
 async function ensureAudio() {
@@ -1199,6 +1233,16 @@ function PieceCard({ pieceType, onZoom }) {
             fontFamily: 'Cinzel, serif', fontSize: 22, fontWeight: 700,
             color: COLORS.ink, letterSpacing: 1.5,
           }}>{data.name}</div>
+          <button
+            onClick={() => onZoom && onZoom(pieceType)}
+            style={{
+              marginTop: 4, padding: 0, background: 'transparent', border: 'none',
+              color: COLORS.gold, cursor: 'pointer', textAlign: 'left',
+              fontSize: 11.5, fontWeight: 600, letterSpacing: 0.3,
+              display: 'flex', alignItems: 'center', gap: 5,
+            }}>
+            👆 Tocá acá o la imagen para ver su habilidad
+          </button>
         </div>
       </div>
       <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'flex-start' }}>
@@ -1235,13 +1279,235 @@ function PieceCard({ pieceType, onZoom }) {
   );
 }
 
+// ============== ANIMACIÓN DE HABILIDAD (loop) ==============
+// Mini-tablero 5x5 donde la pieza (Dorada) usa su habilidad sobre una pieza
+// rival (Carmesí), en bucle, mientras el apartado está abierto.
+const ANIM_CFG = {
+  monarca:   { kind: 'leap',   atk: [2,1], vic: [2,3], over: [2,2], caption: 'Salta 2 casillas sobre una pieza y captura.' },
+  hechicera: { kind: 'ranged', atk: [2,1], vic: [2,4], bolt: '#C9A6FF', caption: 'Lanza un hechizo a distancia, sin moverse.' },
+  fortaleza: { kind: 'ranged', atk: [2,2], vic: [2,3], bolt: '#FFB74D', caption: 'Aplasta a la pieza adyacente, sin moverse.' },
+  druida:    { kind: 'spawn',  atk: [2,1], vic: [2,2], caption: 'Invoca un Infante aliado en una casilla vacía.' },
+  jinete:    { kind: 'double', atk: [4,0], mid: [1,1], vic: [2,4], caption: 'Hace dos saltos de Jinete seguidos en el mismo turno.' },
+  caballero: { kind: 'dash',   atk: [2,0], vic: [2,4], caption: 'Embiste en línea recta hasta 4 casillas.' },
+  infante:   { kind: 'morph',  atk: [2,2], morphTo: 'caballero', caption: 'Se transforma en otra pieza (excepto Monarca).' },
+};
+
+function AbilityAnimation({ pieceType }) {
+  const cfg = ANIM_CFG[pieceType];
+  const [phase, setPhase] = useState(0);
+  const N = 5, cell = 46, gap = 2, pad = 6;
+  const PHASE_MS = [1000, 950, 1150, 750];
+
+  useEffect(() => {
+    let ph = 0;
+    setPhase(0);
+    let t = setTimeout(function tick() {
+      ph = (ph + 1) % 4;
+      setPhase(ph);
+      t = setTimeout(tick, PHASE_MS[ph]);
+    }, PHASE_MS[0]);
+    return () => clearTimeout(t);
+  }, [pieceType]);
+
+  if (!cfg) return null;
+
+  const boardW = pad * 2 + N * cell + (N - 1) * gap;
+  const xy = ([r, c]) => ({ x: pad + c * (cell + gap), y: pad + r * (cell + gap) });
+  const pieceSize = cell - 10;
+  const inset = (cell - pieceSize) / 2;
+
+  // Estado de la escena según fase + tipo.
+  let atkCell = cfg.atk;
+  let atkScale = 1;
+  let atkType = pieceType;
+  let vicVisible = true;
+  let boltOn = false;
+  let burstOn = false;
+  let burstCell = cfg.vic || cfg.atk;
+  let spawnOn = false;
+
+  switch (cfg.kind) {
+    case 'ranged':
+      boltOn = phase === 1;
+      if (phase >= 2) vicVisible = false;
+      burstOn = phase === 2;
+      break;
+    case 'dash':
+      atkCell = phase === 0 ? cfg.atk : cfg.vic;
+      if (phase >= 2) vicVisible = false;
+      burstOn = phase === 2;
+      break;
+    case 'leap':
+      atkCell = phase === 0 ? cfg.atk : cfg.vic;
+      atkScale = phase === 1 ? 1.18 : 1;
+      if (phase >= 2) vicVisible = false;
+      burstOn = phase === 2;
+      break;
+    case 'double':
+      atkCell = phase === 0 ? cfg.atk : (phase === 1 ? cfg.mid : cfg.vic);
+      if (phase >= 2) vicVisible = false;
+      burstOn = phase === 2;
+      break;
+    case 'spawn':
+      spawnOn = phase >= 1;
+      vicVisible = false; // la casilla destino arranca vacía
+      break;
+    case 'morph':
+      atkScale = phase === 1 ? 0.45 : 1;
+      atkType = phase >= 2 ? cfg.morphTo : 'infante';
+      burstOn = phase === 2;
+      burstCell = cfg.atk;
+      vicVisible = false;
+      break;
+    default: break;
+  }
+
+  // Casillas que se pintan de ROJO al activar la habilidad (igual que en el juego,
+  // donde la casilla objetivo se resalta en rojo). Se muestran en el momento de
+  // "activación" (antes de que se ejecute la captura/efecto).
+  let redCells = [];
+  if (cfg.kind === 'spawn') {
+    if (phase === 0) redCells = [cfg.vic];          // casilla vacía resaltada antes del Brote
+  } else if (cfg.kind === 'morph') {
+    redCells = [];                                  // la Coronación se elige por menú, no resalta casillas
+  } else if (cfg.vic) {
+    if (phase === 0 || phase === 1) redCells = [cfg.vic];
+  }
+
+  const atkPos = xy(atkCell);
+  const vicPos = cfg.vic ? xy(cfg.vic) : { x: 0, y: 0 };
+  const boltPos = boltOn ? vicPos : atkPos;
+  const bPos = xy(burstCell);
+
+  const pieceWrap = {
+    position: 'absolute', width: pieceSize, height: pieceSize, zIndex: 2,
+    transition: 'left 0.55s cubic-bezier(.4,0,.2,1), top 0.55s cubic-bezier(.4,0,.2,1), transform 0.4s ease, opacity 0.45s ease',
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
+      <div style={{
+        position: 'relative', width: boardW, height: boardW,
+        background: COLORS.cardLight, padding: 0, borderRadius: 8,
+        border: `1px solid ${COLORS.goldDeep}66`, overflow: 'hidden',
+      }}>
+        {/* Tablero (casillas) */}
+        {Array.from({ length: N }, (_, r) => Array.from({ length: N }, (_, c) => {
+          const dark = (r + c) % 2 === 1;
+          const p = xy([r, c]);
+          return (
+            <div key={`${r}-${c}`} style={{
+              position: 'absolute', left: p.x, top: p.y, width: cell, height: cell,
+              background: dark ? '#6B4A2B' : '#D9CAA5',
+            }}/>
+          );
+        }))}
+
+        {/* Cuadros rojos de objetivo (igual que al activar la habilidad en el juego) */}
+        {redCells.map(([r, c], i) => {
+          const p = xy([r, c]);
+          return (
+            <div key={`red-${i}`} style={{
+              position: 'absolute', left: p.x, top: p.y, width: cell, height: cell,
+              background: COLORS.tileCap,
+              boxShadow: `inset 0 0 0 2px ${COLORS.crimsonDeep}, 0 0 10px ${COLORS.tileCap}aa`,
+              transition: 'opacity 0.2s ease',
+              zIndex: 1,
+            }}/>
+          );
+        })}
+
+        {/* Víctima (Carmesí) — la pieza que recibe la habilidad */}
+        {cfg.vic && cfg.kind !== 'spawn' && cfg.kind !== 'morph' && (
+          <div style={{
+            ...pieceWrap,
+            left: vicPos.x + inset, top: vicPos.y + inset,
+            opacity: vicVisible ? 1 : 0,
+            transform: vicVisible ? 'scale(1)' : 'scale(0.1)',
+          }}>
+            <PieceImage piece={{ type: cfg.vicType || 'jinete', color: 'crimson' }} size={pieceSize} />
+          </div>
+        )}
+
+        {/* Infante invocado por la Druida (Dorado) */}
+        {cfg.kind === 'spawn' && (
+          <div style={{
+            ...pieceWrap,
+            left: vicPos.x + inset, top: vicPos.y + inset,
+            opacity: spawnOn ? 1 : 0,
+            transform: spawnOn ? 'scale(1)' : 'scale(0.1)',
+            borderRadius: '50%',
+            animation: spawnOn ? 'realezaSprout 1.1s ease-in-out infinite' : 'none',
+          }}>
+            <PieceImage piece={{ type: 'infante', color: 'gold' }} size={pieceSize} />
+          </div>
+        )}
+
+        {/* Pieza que salta por encima (Monarca) */}
+        {cfg.over && (
+          <div style={{
+            position: 'absolute',
+            left: xy(cfg.over).x + inset, top: xy(cfg.over).y + inset,
+            width: pieceSize, height: pieceSize,
+          }}>
+            <PieceImage piece={{ type: 'fortaleza', color: 'gold' }} size={pieceSize} dimmed />
+          </div>
+        )}
+
+        {/* Rayo / proyectil (habilidades a distancia) */}
+        {cfg.bolt && (
+          <div style={{
+            position: 'absolute',
+            left: boltPos.x + cell / 2 - 7, top: boltPos.y + cell / 2 - 7,
+            width: 14, height: 14, borderRadius: '50%',
+            background: cfg.bolt, color: cfg.bolt,
+            opacity: boltOn ? 1 : 0,
+            transition: 'left 0.5s ease-in, top 0.5s ease-in, opacity 0.3s ease',
+            animation: 'realezaBolt 0.6s ease-in-out infinite',
+            zIndex: 3,
+          }}/>
+        )}
+
+        {/* Atacante (Dorado) */}
+        <div style={{
+          ...pieceWrap,
+          left: atkPos.x + inset, top: atkPos.y + inset,
+          transform: `scale(${atkScale})`,
+          zIndex: 3,
+        }}>
+          <PieceImage piece={{ type: atkType, color: 'gold' }} size={pieceSize} />
+        </div>
+
+        {/* Estallido de captura / transformación */}
+        {burstOn && (
+          <div style={{
+            position: 'absolute',
+            left: bPos.x + cell / 2, top: bPos.y + cell / 2,
+            width: cell, height: cell, borderRadius: '50%',
+            border: `3px solid ${COLORS.goldBright}`,
+            animation: 'realezaBurst 0.85s ease-out forwards',
+            pointerEvents: 'none', zIndex: 4,
+          }}/>
+        )}
+      </div>
+      <div style={{ fontSize: 11.5, color: COLORS.inkMute, textAlign: 'center', lineHeight: 1.4, maxWidth: boardW + 40 }}>
+        {cfg.caption}
+      </div>
+    </div>
+  );
+}
+
 function PieceZoomModal({ pieceType, onClose }) {
+  const [showAnim, setShowAnim] = useState(false);
   // Cerrar con tecla Escape (hook DEBE ir antes de cualquier early return)
   useEffect(() => {
     const onKey = (e) => { if (e.key === 'Escape') onClose(); };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
+
+  // Si cambia la pieza, arrancamos con la animación cerrada.
+  useEffect(() => { setShowAnim(false); }, [pieceType]);
 
   const data = PIECE_DATA[pieceType];
   if (!pieceType) return null;
@@ -1265,6 +1531,7 @@ function PieceZoomModal({ pieceType, onClose }) {
           borderRadius: 14,
           padding: 24,
           maxWidth: 520, width: '100%',
+          maxHeight: '92vh', overflowY: 'auto',
           border: `2px solid ${COLORS.gold}`,
           boxShadow: `0 8px 40px rgba(0,0,0,0.7), 0 0 0 1px ${COLORS.gold}33`,
           cursor: 'default', position: 'relative',
@@ -1344,6 +1611,38 @@ function PieceZoomModal({ pieceType, onClose }) {
               </div>
               <div style={{ fontSize: 12.5, color: COLORS.ink, lineHeight: 1.5 }}>{data.abilityDesc}</div>
             </div>
+
+            {/* Botón para ver la animación de la habilidad en acción */}
+            <button
+              onClick={() => setShowAnim(v => !v)}
+              style={{
+                width: '100%', padding: '10px 12px',
+                background: showAnim ? COLORS.cardLight : COLORS.gold,
+                color: showAnim ? COLORS.gold : '#1A1410',
+                border: `1px solid ${COLORS.gold}`,
+                borderRadius: 6,
+                fontFamily: 'Cinzel, serif', fontWeight: 600, letterSpacing: 1,
+                fontSize: 12, cursor: 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+                transition: 'all 0.15s',
+              }}>
+              {showAnim ? '▲ OCULTAR ANIMACIÓN' : '▶ TOCÁ PARA VER LA HABILIDAD EN ACCIÓN'}
+            </button>
+
+            {showAnim && (
+              <div style={{
+                background: COLORS.bg,
+                border: `1px solid ${COLORS.goldDeep}66`,
+                borderRadius: 8, padding: 12,
+                display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8,
+              }}>
+                <div style={{
+                  fontSize: 10, letterSpacing: 1.5, color: COLORS.gold,
+                  fontFamily: 'Cinzel, serif', fontWeight: 600,
+                }}>USO DE LA HABILIDAD</div>
+                <AbilityAnimation pieceType={pieceType} />
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -1473,13 +1772,13 @@ function ReglasTab() {
         </Sub>
         <Sub title="Lista de habilidades">
           <ul style={{ paddingLeft: 18, marginTop: 0 }}>
-            <li style={li}><strong>Salto Real</strong> (Monarca): salta 2 casillas en cruz pasando por encima de piezas. Útil para escapar de amenazas. <em>1 vez por partida</em>.</li>
-            <li style={li}><strong>Hechizo Letal</strong> (Hechicera): captura sin moverse cualquier pieza enemiga a hasta 3 casillas. <em>Cooldown: 6 turnos</em>.</li>
+            <li style={li}><strong>Salto Real</strong> (Monarca): salta 2 casillas en cruz pasando por encima de piezas. Sirve para escapar de amenazas <strong>y también para capturar</strong>: si cae sobre una pieza enemiga, la come (incluso al Monarca rival). <em>1 vez por partida</em>.</li>
+            <li style={li}><strong>Hechizo Letal</strong> (Hechicera): captura sin moverse cualquier pieza enemiga a hasta 3 casillas, <strong>excepto el Monarca</strong> (al Monarca solo se lo puede capturar con un movimiento normal). <em>Cooldown: 6 turnos</em>.</li>
             <li style={li}><strong>Aplastar</strong> (Fortaleza): captura sin moverse una pieza enemiga adyacente. <em>Cooldown: 5 turnos</em>.</li>
             <li style={li}><strong>Brote</strong> (Druida): invoca un Infante aliado nuevo en una casilla vacía adyacente. <em>Cooldown: 8 turnos</em>.</li>
             <li style={li}><strong>Doble Galope</strong> (Jinete): permite hacer 2 movimientos seguidos en el mismo turno. Bloqueado en Jinetes recién creados o promocionados (deben esperar al menos 2 turnos). <em>Cooldown: 8 turnos</em>.</li>
             <li style={li}><strong>Embestida</strong> (Caballero): este turno se mueve hasta 4 casillas en cualquier dirección (puede capturar al final). <em>Cooldown: 5 turnos</em>.</li>
-            <li style={li}><strong>Coronación Anticipada</strong> (Infante): se transforma en cualquier pieza (excepto Monarca) sin moverse. <strong>Solo disponible en la mitad enemiga del tablero</strong> (filas 1-4 para el Carmesí; filas 5-8 para el Dorado, según donde esté tu Infante). <em>1 vez por partida</em>.</li>
+            <li style={li}><strong>Coronación Anticipada</strong> (Infante): se transforma en cualquier pieza (excepto Monarca) sin moverse. <strong>Disponible al llegar a la mitad de la cancha o más allá</strong> (la fila central ya cuenta). Funciona con cualquier Infante, incluidos los creados por la Druida. <em>1 vez por partida</em>.</li>
           </ul>
         </Sub>
         <div style={tip}>
@@ -1583,6 +1882,17 @@ function SoundToggleRow({ label, description, icon, checked, onChange }) {
   );
 }
 
+// === Formato de reloj para los temporalizadores ===
+// < 1 h  -> mm:ss   ;   >= 1 h -> h:mm:ss
+function formatClock(ms) {
+  const totalSec = Math.max(0, Math.floor((ms || 0) / 1000));
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+}
+
 function JugarTab({ multiplayer = null }) {
   // === MULTIPLAYER CONTEXT ===
   const myColor = multiplayer ? multiplayer.game.color : 'gold';
@@ -1620,6 +1930,66 @@ function JugarTab({ multiplayer = null }) {
   const [turnNumber, setTurnNumber] = useState(0);
   const [sfxOn, setSfxOn] = useState(soundConfig.effects);
   const [ambientOn, setAmbientOn] = useState(soundConfig.ambient);
+
+  // === TEMPORALIZADORES (task: reloj por jugador + reloj total) ===
+  // - Cada color tiene su reloj, que corre SOLO durante su turno y se frena
+  //   cuando le toca al rival. Se maneja por completo a partir del estado `turn`
+  //   y `winner`, así funciona idéntico en IA y en online (donde el turno lo
+  //   manda el servidor).
+  // - El reloj TOTAL arranca al empezar la partida y no se detiene hasta que hay
+  //   ganador; muestra cuánto duró la partida en total.
+  const [clockDisplay, setClockDisplay] = useState({ gold: 0, crimson: 0, total: 0 });
+  const clockAccumRef = useRef({ gold: 0, crimson: 0 }); // ms acumulados de turnos ya cerrados
+  const clockActiveRef = useRef(null);                   // color del segmento abierto
+  const clockSegStartRef = useRef(null);                 // timestamp de inicio del segmento
+  const clockTotalStartRef = useRef(null);               // timestamp de inicio del total
+  const clockTotalFinalRef = useRef(null);               // total congelado al terminar
+  const clockRunningRef = useRef(false);                 // ¿algún reloj corriendo?
+
+  // === Inicio de partida + animación "¡A LAS ARMAS!" ===
+  // La partida (y los relojes) NO arranca sola: contra la IA hay un botón
+  // "COMENZAR PARTIDA"; online arranca al conectar, pero siempre con un cartel
+  // de inicio estilo juego de pelea para avisar que empezó.
+  const [started, setStarted] = useState(false);
+  const startedRef = useRef(false);
+  const [goAnim, setGoAnim] = useState(false);
+  const goTimerRef = useRef(null);
+
+  function triggerGo() {
+    setGoAnim(true);
+    if (goTimerRef.current) clearTimeout(goTimerRef.current);
+    goTimerRef.current = setTimeout(() => setGoAnim(false), 1500);
+  }
+
+  function startMatch() {
+    if (startedRef.current) return;
+    startedRef.current = true;
+    setStarted(true);     // dispara el efecto de relojes (abre el 1er segmento)
+    ensureAudio();        // desbloquea/recalienta el audio dentro del gesto
+    triggerGo();
+  }
+
+  function clockSnapshot() {
+    const now = Date.now();
+    const acc = clockAccumRef.current;
+    const g = acc.gold + (clockActiveRef.current === 'gold' && clockSegStartRef.current != null ? now - clockSegStartRef.current : 0);
+    const c = acc.crimson + (clockActiveRef.current === 'crimson' && clockSegStartRef.current != null ? now - clockSegStartRef.current : 0);
+    const total = clockTotalFinalRef.current != null
+      ? clockTotalFinalRef.current
+      : (clockTotalStartRef.current != null ? now - clockTotalStartRef.current : 0);
+    return { gold: g, crimson: c, total };
+  }
+
+  // Deja los relojes en CERO y "sin arrancar". Arrancan recién con startMatch().
+  function resetClocks() {
+    clockAccumRef.current = { gold: 0, crimson: 0 };
+    clockTotalFinalRef.current = null;
+    clockTotalStartRef.current = null;
+    clockActiveRef.current = null;
+    clockSegStartRef.current = null;
+    clockRunningRef.current = false;
+    setClockDisplay({ gold: 0, crimson: 0, total: 0 });
+  }
 
   // Iniciar/parar música ambiente cuando cambia el toggle
   useEffect(() => {
@@ -1661,6 +2031,64 @@ function JugarTab({ multiplayer = null }) {
       turnNumberRef.current = serverTurn.turnNumber;
     }
   }, [multiplayer, serverTurn]);
+
+  // Mantener startedRef en sincronía con el estado.
+  useEffect(() => { startedRef.current = started; }, [started]);
+
+  // Online: la partida arranca al conectar. Lanzamos el inicio (cartel + relojes)
+  // una sola vez al montar en modo multijugador.
+  useEffect(() => {
+    if (multiplayer && !startedRef.current) startMatch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [multiplayer]);
+
+  // === TEMPORALIZADORES: abrir/cerrar segmentos según `turn`, `winner` y `started` ===
+  // Cada vez que cambia de quién es el turno, cerramos el segmento del color
+  // anterior (sumando su tiempo) y abrimos el del nuevo. Al haber ganador,
+  // congelamos todo (incluido el total). Si la partida no arrancó, no corre nada.
+  useEffect(() => {
+    const now = Date.now();
+    if (winner) {
+      // Cerrar el segmento activo y congelar el total.
+      if (clockActiveRef.current && clockSegStartRef.current != null) {
+        clockAccumRef.current[clockActiveRef.current] += now - clockSegStartRef.current;
+      }
+      clockActiveRef.current = null;
+      clockSegStartRef.current = null;
+      if (clockTotalFinalRef.current == null && clockTotalStartRef.current != null) {
+        clockTotalFinalRef.current = now - clockTotalStartRef.current;
+      }
+      clockRunningRef.current = false;
+      setClockDisplay(clockSnapshot());
+      return;
+    }
+    if (!started) {
+      // Todavía no se apretó "Comenzar partida": relojes en 0, sin correr.
+      clockRunningRef.current = false;
+      return;
+    }
+    // Partida en curso: asegurar que el total esté corriendo.
+    if (clockTotalStartRef.current == null) clockTotalStartRef.current = now;
+    clockTotalFinalRef.current = null;
+    clockRunningRef.current = true;
+    // Cambió el color activo → cerrar el anterior y abrir el nuevo.
+    if (clockActiveRef.current !== turn) {
+      if (clockActiveRef.current && clockSegStartRef.current != null) {
+        clockAccumRef.current[clockActiveRef.current] += now - clockSegStartRef.current;
+      }
+      clockActiveRef.current = turn;
+      clockSegStartRef.current = now;
+    }
+    setClockDisplay(clockSnapshot());
+  }, [turn, winner, started]);
+
+  // Tick de pantalla: refresca los relojes 4 veces por segundo mientras corren.
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (clockRunningRef.current) setClockDisplay(clockSnapshot());
+    }, 250);
+    return () => clearInterval(id);
+  }, []);
 
   // === AUDIO: pausar/reanudar al minimizar la app ===
   // Evita que el reverb del ambient siga colgado distorsionado en background,
@@ -1726,6 +2154,12 @@ function JugarTab({ multiplayer = null }) {
     setTurnNumber(0);
     aiAbilitiesUsedRef.current = 0;
     lastRemoteTnRef.current = -1;
+    resetClocks();
+    // Volver al estado "sin empezar": contra la IA reaparece el botón Comenzar.
+    // Online se vuelve a iniciar solo (efecto de multiplayer), con su cartel.
+    setGoAnim(false);
+    if (multiplayer) { startedRef.current = false; setStarted(false); startMatch(); }
+    else { startedRef.current = false; setStarted(false); }
   }
 
   const selectedPiece = selectedId ? pieces.find(p => p.id === selectedId && !p.captured) : null;
@@ -1960,7 +2394,7 @@ function JugarTab({ multiplayer = null }) {
   }
 
   // === AI TURN ===
-  const isAiTurn = !multiplayer && turn === 'crimson' && !winner && !animating && !promotionPick;
+  const isAiTurn = !multiplayer && started && turn === 'crimson' && !winner && !animating && !promotionPick;
   useEffect(() => {
     if (!isAiTurn) return;
     setAiThinking(true);
@@ -2123,6 +2557,7 @@ function JugarTab({ multiplayer = null }) {
 
   function onSquareClick(r, c) {
     ensureAudio();
+    if (!started) return; // la partida todavía no arrancó (falta apretar "Comenzar")
     if (winner || turn !== myColor || aiThinking || animating || promotionPick) return;
 
     if (pendingJinete && pendingJinete.phase === 'second' && !pendingJinete.aiMode) {
@@ -2243,7 +2678,10 @@ function JugarTab({ multiplayer = null }) {
         if (dr===0 && dc===0) continue;
         const nr = r+dr, nc = c+dc;
         // FIX: apuntar a piezas del oponente (oppColor), no a 'crimson' fijo
-        if (inBounds(nr,nc) && board[nr][nc] && board[nr][nc].color === oppColor) {
+        // NERF: el Hechizo Letal NO puede capturar al Monarca enemigo.
+        // Al Monarca solo se lo puede comer con vía libre (movimiento normal).
+        if (inBounds(nr,nc) && board[nr][nc] && board[nr][nc].color === oppColor
+            && board[nr][nc].type !== 'monarca') {
           targets.push([nr,nc]);
         }
       }
@@ -2293,13 +2731,16 @@ function JugarTab({ multiplayer = null }) {
       setActiveAbility('jinete');
       setPendingJinete({ pieceId: piece.id, phase: 'first' });
     } else if (type === 'infante') {
-      // Solución B: Coronación Anticipada solo en mitad enemiga del tablero
-      // Dorado (gold) avanza hacia r=0 → mitad enemiga = filas 0-3
-      // Carmesí (crimson) avanza hacia r=8 → mitad enemiga = filas 5-8
-      const inEnemyHalf = (piece.color === 'gold' && piece.row <= 3) ||
-                          (piece.color === 'crimson' && piece.row >= 5);
+      // Solución B: Coronación Anticipada disponible al llegar a la mitad de la cancha (o más allá).
+      // El tablero tiene 9 filas (0-8); la fila central es la 4.
+      // Dorado (gold) avanza hacia r=0 → habilitado en filas 0-4 (mitad enemiga + centro).
+      // Carmesí (crimson) avanza hacia r=8 → habilitado en filas 4-8 (mitad enemiga + centro).
+      // FIX: antes se excluía la fila central (4), por eso un Infante que llegaba
+      // justo a la mitad no se podía coronar. Ahora alcanzar el centro ya habilita.
+      const inEnemyHalf = (piece.color === 'gold' && piece.row <= 4) ||
+                          (piece.color === 'crimson' && piece.row >= 4);
       if (!inEnemyHalf) {
-        logEntry('⚠️ Coronación bloqueada: el Infante debe estar en mitad enemiga');
+        logEntry('⚠️ Coronación bloqueada: el Infante debe llegar al menos a la mitad de la cancha');
         return;
       }
       setActiveAbility('infante');
@@ -2319,8 +2760,9 @@ function JugarTab({ multiplayer = null }) {
       executeMove(piece.id, tr, tc, true, 'Salto Real');
     } else if (type === 'hechicera') {
       const targetP = piecesRef.current.find(p => !p.captured && p.row === tr && p.col === tc);
-      // SAFETY: no permitir auto-captura (defensa contra bug de targeting)
-      if (!targetP || targetP.color === myColor) return;
+      // SAFETY: no permitir auto-captura ni capturar al Monarca con el Hechizo Letal
+      // (defensa contra bug de targeting + NERF de la Hechicera)
+      if (!targetP || targetP.color === myColor || targetP.type === 'monarca') return;
       playAbility('hechicera');
       sendIfLocal({ kind: 'spell', abilityKey: 'hechicera', attackerId: piece.id, victimId: targetP.id, cooldownVal: 7, abilityLabel: 'Hechizo Letal' });
       setAnimating(true);
@@ -2733,6 +3175,53 @@ function JugarTab({ multiplayer = null }) {
         )}
       </div>
 
+      {/* Temporalizadores: reloj por jugador + total */}
+      <div style={{
+        background: COLORS.card, borderRadius: 10, padding: '10px 12px',
+        border: `1px solid ${COLORS.goldDeep}66`,
+      }}>
+        <div style={{ display: 'flex', gap: 8 }}>
+          {['gold', 'crimson'].map(col => {
+            const active = started && !winner && turn === col;
+            const isGold = col === 'gold';
+            const accent = isGold ? COLORS.gold : COLORS.crimson;
+            return (
+              <div key={col} style={{
+                flex: 1,
+                background: active ? `${accent}22` : COLORS.bg,
+                border: `1px solid ${active ? accent : COLORS.goldDeep + '44'}`,
+                borderRadius: 8, padding: '8px 10px',
+                boxShadow: active ? `0 0 10px ${accent}55` : 'none',
+                transition: 'all 0.2s',
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                  <div style={{
+                    width: 9, height: 9, borderRadius: '50%', background: accent,
+                    boxShadow: active ? `0 0 6px ${accent}` : 'none',
+                    animation: active ? 'pulse 1.1s ease-in-out infinite' : 'none',
+                  }}/>
+                  <span style={{ fontFamily: 'Cinzel, serif', fontSize: 10, letterSpacing: 1.2, color: accent, fontWeight: 600 }}>
+                    {isGold ? 'DORADO' : 'CARMESÍ'}{multiplayer && myColor === col ? ' (VOS)' : ''}
+                  </span>
+                </div>
+                <div style={{ fontFamily: 'monospace', fontSize: 22, fontWeight: 700, color: COLORS.ink, letterSpacing: 1 }}>
+                  {formatClock(clockDisplay[col])}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div style={{
+          marginTop: 8, display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 8,
+          borderTop: `1px solid ${COLORS.goldDeep}33`, paddingTop: 8,
+        }}>
+          <span style={{ fontFamily: 'Cinzel, serif', fontSize: 10, letterSpacing: 1.5, color: COLORS.inkMute }}>⏱ TOTAL</span>
+          <span style={{ fontFamily: 'monospace', fontSize: 16, fontWeight: 700, color: COLORS.gold, letterSpacing: 1 }}>
+            {formatClock(clockDisplay.total)}
+          </span>
+        </div>
+      </div>
+
       {/* Promotion modal */}
       {promotionPick && (
         <div style={{
@@ -2764,6 +3253,23 @@ function JugarTab({ multiplayer = null }) {
         </div>
       )}
 
+      {/* Botón COMENZAR PARTIDA (solo vs IA y antes de empezar) */}
+      {!multiplayer && !started && (
+        <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 4 }}>
+          <button onClick={startMatch} style={{
+            width: '100%', maxWidth: 420, padding: '14px 18px',
+            background: `linear-gradient(135deg, ${COLORS.goldBright} 0%, ${COLORS.gold} 50%, ${COLORS.goldDeep} 100%)`,
+            color: '#1A1410', border: `2px solid ${COLORS.goldBright}`,
+            borderRadius: 10, cursor: 'pointer',
+            fontFamily: 'Cinzel, serif', fontWeight: 700, letterSpacing: 2, fontSize: 16,
+            boxShadow: `0 4px 16px ${COLORS.goldDeep}88`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
+          }}>
+            ⚔️ COMENZAR PARTIDA
+          </button>
+        </div>
+      )}
+
       {/* Board */}
       <div style={{ display: 'flex', justifyContent: 'center' }}>
         <div style={{
@@ -2776,6 +3282,26 @@ function JugarTab({ multiplayer = null }) {
           <div style={{
             position: 'relative', width: boardSize, height: boardSize, background: '#000',
           }}>
+            {/* Cartel de inicio "¡A LAS ARMAS!" (estilo juego de pelea) */}
+            {goAnim && (
+              <div style={{
+                position: 'absolute', inset: 0, zIndex: 50,
+                display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+                pointerEvents: 'none',
+                background: 'radial-gradient(circle at center, rgba(0,0,0,0.35) 0%, rgba(0,0,0,0) 70%)',
+              }}>
+                <div style={{
+                  fontFamily: 'Cinzel, serif', fontWeight: 700,
+                  fontSize: Math.max(28, Math.floor(boardSize / 9)),
+                  letterSpacing: 3, color: COLORS.goldBright,
+                  textShadow: `0 0 18px ${COLORS.gold}, 0 3px 6px #000, 0 0 40px ${COLORS.crimson}`,
+                  animation: 'realezaGo 1.5s ease-out forwards',
+                  textAlign: 'center', lineHeight: 1.1,
+                }}>
+                  ¡A LAS ARMAS!
+                </div>
+              </div>
+            )}
             <div style={{
               display: 'grid',
               gridTemplateColumns: `repeat(${BOARD_SIZE}, ${cellSize}px)`,
@@ -2977,7 +3503,11 @@ function Realeza() {
     if (!document.getElementById('realeza-style')) {
       const style = document.createElement('style');
       style.id = 'realeza-style';
-      style.textContent = `@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }`;
+      style.textContent = `@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+@keyframes realezaBurst { 0% { transform: translate(-50%,-50%) scale(0.2); opacity: 0.9; } 100% { transform: translate(-50%,-50%) scale(2.4); opacity: 0; } }
+@keyframes realezaSprout { 0%,100% { box-shadow: 0 0 0 0 rgba(127,175,107,0.0); } 50% { box-shadow: 0 0 10px 3px rgba(127,175,107,0.7); } }
+@keyframes realezaBolt { 0% { box-shadow: 0 0 4px 1px currentColor; } 50% { box-shadow: 0 0 12px 5px currentColor; } 100% { box-shadow: 0 0 4px 1px currentColor; } }
+@keyframes realezaGo { 0% { transform: scale(0.2); opacity: 0; } 22% { transform: scale(1.18); opacity: 1; } 60% { transform: scale(1); opacity: 1; } 80% { transform: scale(1.04); opacity: 1; } 100% { transform: scale(1.5); opacity: 0; } }`;
       document.head.appendChild(style);
     }
   }, []);
