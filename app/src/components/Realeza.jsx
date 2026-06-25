@@ -2126,8 +2126,20 @@ function JugarTab({ multiplayer = null }) {
     if (!multiplayer) return;
     if (turnRef.current !== myColor) return;
     try {
-      multiplayer.sendAction({ ...action, turnEnds });
+      // ANTI-DESYNC: adjuntamos SIEMPRE el tablero completo resultante (verdad
+      // absoluta del que mueve). El rival lo copia exacto, así nunca quedan
+      // piezas encimadas/congeladas por reconstrucción independiente.
+      multiplayer.sendAction({ ...action, turnEnds, pieces: piecesSnapshot() });
     } catch (_) {}
+  }
+
+  // Foto mínima del tablero para sincronizar al rival (verdad absoluta).
+  function piecesSnapshot() {
+    return piecesRef.current.map(p => ({
+      id: p.id, type: p.type, color: p.color,
+      row: p.row, col: p.col, captured: !!p.captured,
+      createdAtTurn: p.createdAtTurn || 0,
+    }));
   }
 
   const board = useMemo(() => computeBoard(pieces), [pieces]);
@@ -2205,19 +2217,13 @@ function JugarTab({ multiplayer = null }) {
     if (!piece || piece.captured) return;
     const target = piecesRef.current.find(p => !p.captured && p.row === toRow && p.col === toCol);
 
-    // Multiplayer: enviar acción al rival si es jugada local
+    // Multiplayer: metadatos para el rival (el envío real va MÁS ABAJO, después
+    // de actualizar el tablero local, para que la foto sincronizada sea correcta).
     let galopePhase = null;
     if (abilityLabel === 'Doble Galope (1°)') galopePhase = 'first';
     else if (abilityLabel === 'Doble Galope (2°)') galopePhase = 'second';
     // El 1er movimiento de Doble Galope NO termina el turno (viene un 2°).
     const movEndsTurn = galopePhase !== 'first';
-    sendIfLocal({
-      kind: 'move',
-      pieceId, toRow, toCol,
-      isAbility: !!isAbility,
-      abilityLabel: abilityLabel || null,
-      galopePhase,
-    }, movEndsTurn);
 
     if (isAbility && abilityLabel) {
       // Ability-based move (Embestida, Salto Real)
@@ -2248,6 +2254,15 @@ function JugarTab({ multiplayer = null }) {
     });
     setPieces(newPieces);
     piecesRef.current = newPieces;
+
+    // Ahora SÍ enviamos al rival, con la foto del tablero ya actualizado.
+    sendIfLocal({
+      kind: 'move',
+      pieceId, toRow, toCol,
+      isAbility: !!isAbility,
+      abilityLabel: abilityLabel || null,
+      galopePhase,
+    }, movEndsTurn);
 
     const coord = `${String.fromCharCode(97+toCol)}${BOARD_SIZE-toRow}`;
     let entry = (piece.color === 'gold' ? '🟡 ' : '🔴 ');
@@ -2362,7 +2377,7 @@ function JugarTab({ multiplayer = null }) {
 
   function aiSpawnInfante(target) {
     playAbility('druida');
-    const newId = `spawn-${pieceIdCounter++}`;
+    const newId = `spawn-crimson-${pieceIdCounter++}`;
     const newPieces = [...piecesRef.current, {
       id: newId, type: 'infante', color: 'crimson', row: target[0], col: target[1], captured: false,
       createdAtTurn: turnNumberRef.current
@@ -2764,12 +2779,12 @@ function JugarTab({ multiplayer = null }) {
       // (defensa contra bug de targeting + NERF de la Hechicera)
       if (!targetP || targetP.color === myColor || targetP.type === 'monarca') return;
       playAbility('hechicera');
-      sendIfLocal({ kind: 'spell', abilityKey: 'hechicera', attackerId: piece.id, victimId: targetP.id, cooldownVal: 7, abilityLabel: 'Hechizo Letal' });
       setAnimating(true);
       const newPieces = piecesRef.current.map(p =>
         p.id === targetP.id ? { ...p, captured: true } : p
       );
       setPieces(newPieces); piecesRef.current = newPieces;
+      sendIfLocal({ kind: 'spell', abilityKey: 'hechicera', attackerId: piece.id, victimId: targetP.id, cooldownVal: 7, abilityLabel: 'Hechizo Letal' });
       setCaptured(prev => ({ ...prev, [oppColor]: [...prev[oppColor], targetP.type] }));
       setCooldowns(prev => ({ ...prev, [myColor]: { ...prev[myColor], hechicera: 7 }}));
       logEntry(`${meEmoji} ⚜ Hechizo Letal ✕ ${PIECE_DATA[targetP.type].name}`);
@@ -2787,12 +2802,12 @@ function JugarTab({ multiplayer = null }) {
       // SAFETY: no permitir auto-captura (defensa contra bug de targeting)
       if (!targetP || targetP.color === myColor) return;
       playAbility('fortaleza');
-      sendIfLocal({ kind: 'spell', abilityKey: 'fortaleza', attackerId: piece.id, victimId: targetP.id, cooldownVal: 6, abilityLabel: 'Aplastar' });
       setAnimating(true);
       const newPieces = piecesRef.current.map(p =>
         p.id === targetP.id ? { ...p, captured: true } : p
       );
       setPieces(newPieces); piecesRef.current = newPieces;
+      sendIfLocal({ kind: 'spell', abilityKey: 'fortaleza', attackerId: piece.id, victimId: targetP.id, cooldownVal: 6, abilityLabel: 'Aplastar' });
       setCaptured(prev => ({ ...prev, [oppColor]: [...prev[oppColor], targetP.type] }));
       setCooldowns(prev => ({ ...prev, [myColor]: { ...prev[myColor], fortaleza: 6 }}));
       logEntry(`${meEmoji} ⚜ Aplastar ✕ ${PIECE_DATA[targetP.type].name}`);
@@ -2807,13 +2822,13 @@ function JugarTab({ multiplayer = null }) {
       setSelectedId(null); setHighlights([]); setAbilityTargets([]); setActiveAbility(null);
     } else if (type === 'druida') {
       playAbility('druida');
-      const newId = `spawn-${pieceIdCounter++}`;
-      sendIfLocal({ kind: 'brote', spawnId: newId, color: myColor, row: tr, col: tc });
+      const newId = `spawn-${myColor}-${pieceIdCounter++}`;
       const newPieces = [...piecesRef.current, {
         id: newId, type: 'infante', color: myColor, row: tr, col: tc, captured: false,
         createdAtTurn: turnNumberRef.current
       }];
       setPieces(newPieces); piecesRef.current = newPieces;
+      sendIfLocal({ kind: 'brote', spawnId: newId, color: myColor, row: tr, col: tc });
       setCooldowns(prev => ({ ...prev, [myColor]: { ...prev[myColor], druida: 9 }}));
       logEntry(`${meEmoji} ⚜ Brote → Infante en ${String.fromCharCode(97+tc)}${BOARD_SIZE-tr}`);
       setSelectedId(null); setHighlights([]); setAbilityTargets([]); setActiveAbility(null);
@@ -2828,11 +2843,11 @@ function JugarTab({ multiplayer = null }) {
   function applyPromotion(newType) {
     if (!promotionPick) return;
     playAbility('infante');
-    sendIfLocal({ kind: 'promote', pieceId: promotionPick.pieceId, newType });
     const newPieces = piecesRef.current.map(p =>
       p.id === promotionPick.pieceId ? { ...p, type: newType, createdAtTurn: turnNumberRef.current } : p
     );
     setPieces(newPieces); piecesRef.current = newPieces;
+    sendIfLocal({ kind: 'promote', pieceId: promotionPick.pieceId, newType });
     setOncePerGame(prev => ({ ...prev, [myColor]: { ...prev[myColor], infante: true }}));
     logEntry(`${myColor === 'gold' ? '🟡' : '🔴'} ⚜ Coronación → ${PIECE_DATA[newType].name}`);
     setPromotionPick(null);
@@ -2890,29 +2905,30 @@ function JugarTab({ multiplayer = null }) {
         break;
       }
       case 'spell': {
-        // Hechizo Letal / Aplastar — captura sin moverse
-        const attacker = piecesRef.current.find(p => p.id === action.attackerId);
+        // Hechizo Letal / Aplastar — captura sin moverse.
+        // El sonido va por la metadata (abilityKey), NO por buscar la pieza,
+        // así suena SIEMPRE (antes, si no encontraba la pieza, descartaba todo
+        // y no sonaba — ej. la Hechicera promovida que quedaba desincronizada).
+        playAbility(action.abilityKey);
         const victim = piecesRef.current.find(p => p.id === action.victimId);
-        if (!attacker || !victim) {
-          // eslint-disable-next-line no-console
-          console.warn('[mp] spell descartado: pieza no encontrada', action);
-          return;
-        }
-        playAbility(attacker.type);
         setAnimating(true);
-        const newPieces = piecesRef.current.map(p =>
-          p.id === victim.id ? { ...p, captured: true } : p
-        );
-        setPieces(newPieces); piecesRef.current = newPieces;
-        setCaptured(prev => ({ ...prev, [myColor]: [...prev[myColor], victim.type] }));
+        if (victim) {
+          const newPieces = piecesRef.current.map(p =>
+            p.id === victim.id ? { ...p, captured: true } : p
+          );
+          setPieces(newPieces); piecesRef.current = newPieces;
+          setCaptured(prev => ({ ...prev, [myColor]: [...prev[myColor], victim.type] }));
+          const coord = `${String.fromCharCode(97+victim.col)}${BOARD_SIZE-victim.row}`;
+          logEntry(`${oppColor === 'gold' ? '🟡' : '🔴'} ⚜ ${action.abilityLabel} ✕ ${PIECE_DATA[victim.type].name} en ${coord}`);
+        } else {
+          logEntry(`${oppColor === 'gold' ? '🟡' : '🔴'} ⚜ ${action.abilityLabel}`);
+        }
         setCooldowns(prev => ({ ...prev, [oppColor]: { ...prev[oppColor], [action.abilityKey]: action.cooldownVal }}));
-        const coord = `${String.fromCharCode(97+victim.col)}${BOARD_SIZE-victim.row}`;
-        logEntry(`${oppColor === 'gold' ? '🟡' : '🔴'} ⚜ ${action.abilityLabel} ✕ ${PIECE_DATA[victim.type].name} en ${coord}`);
-        const isKing = victim.type === 'monarca';
+        const isKing = !!victim && victim.type === 'monarca';
         setTimeout(() => isKing ? playKingCapture() : playRegularCapture(), 250);
         setTimeout(() => {
           setAnimating(false);
-          const w = checkWinAfterMove(newPieces);
+          const w = checkWinAfterMove(piecesRef.current);
           if (w) { setWinner(w); setTimeout(() => { if (w===myColor) playVictory(); else playDefeat(); }, isKing ? 1500 : 200); return; }
           endTurn(oppColor);
         }, ANIM_MS);
@@ -2944,6 +2960,17 @@ function JugarTab({ multiplayer = null }) {
         break;
       }
       default: break;
+    }
+
+    // ===== ANTI-DESYNC (verdad absoluta) =====
+    // El que movió mandó su tablero completo. Lo copiamos EXACTO. Esto corrige
+    // cualquier diferencia entre los dos teléfonos (promociones, conversiones,
+    // capturas, brote, etc.) y elimina las piezas encimadas/congeladas, sin
+    // importar el detalle de la acción. Es la red de seguridad del online.
+    if (Array.isArray(action.pieces)) {
+      const snap = action.pieces.map(p => ({ ...p }));
+      setPieces(snap);
+      piecesRef.current = snap;
     }
   }
 
@@ -3034,9 +3061,10 @@ function JugarTab({ multiplayer = null }) {
 
       {/* Difficulty selector (solo en modo IA) */}
       {!multiplayer && (() => {
-        // La dificultad se bloquea apenas empieza la partida (se hizo al menos un movimiento).
-        // Para cambiarla hay que REINICIAR y elegir antes de empezar.
-        const difficultyLocked = turnNumber > 0;
+        // La dificultad se bloquea apenas ARRANCA la partida (al apretar
+        // "COMENZAR PARTIDA"), o si ya se hizo algún movimiento. Para cambiarla
+        // hay que REINICIAR y elegir antes de empezar.
+        const difficultyLocked = started || turnNumber > 0;
         return (
         <div style={{
           background: COLORS.card, borderRadius: 10, padding: '10px 12px',
