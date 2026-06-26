@@ -762,78 +762,88 @@ function setAmbient(on) {
 
 // =====================================================================
 // === SFX por archivo mp3 (carpeta /public/sounds, 17 archivos) ===
-// HTMLAudio (lo único que suena bien en este WebView; Web Audio quedaba mudo).
-// UN solo elemento <audio> por sonido, precargado y "desbloqueado" en el primer
-// gesto del usuario. Se reusa siempre (no clonamos ni creamos nuevos), así está
-// siempre listo para sonar al instante —incluido al RECIBIR la jugada del rival
-// en online, donde no hay un gesto en ese momento—.
+// HTMLAudio (lo único que suena bien en este WebView). 2 instancias <audio> por
+// sonido (un "pool"), precargadas y desbloqueadas en el primer gesto del usuario.
+// Se reusan (no clonamos), así están siempre listas para sonar al instante,
+// también al RECIBIR la jugada del rival en online (sin gesto en ese momento).
 //
-// Por qué al rival le sonaban "algunas sí y otras no":
-//   1) Desbloquear 51 audios a la vez superaba el límite de reproducciones
-//      simultáneas del WebView y dejaba varios "muertos" (sin desbloquear).
-//      → Ahora hay 17 elementos (uno por sonido) y se desbloquean DE A UNO.
-//   2) El auto-arranque online llamaba al desbloqueo FUERA de un gesto y marcaba
-//      el audio como "ya desbloqueado" aunque fallaba, tapando el desbloqueo real.
-//      → Ahora se desbloquea desde los gestos del lobby (primeRealezaAudio).
+// Por qué a cada jugador le quedaban sonidos distintos mudos:
+//   El desbloqueo anterior era ENCADENADO (cada sonido esperaba a que el
+//   anterior resolviera su play()). Si una promesa se colgaba, los siguientes
+//   NUNCA se desbloqueaban — y se colgaba en un sonido diferente en cada celu.
+//   → Ahora el desbloqueo es FIRE-AND-FORGET (no encadena, no se puede colgar).
+//   Y al reproducir, si falla una instancia probamos con la otra del pool
+//   (clave para sonidos rápidos como el Doble Galope del Jinete).
 // Respeta soundConfig.effects (toggle de "Sonidos de piezas").
 // =====================================================================
-const sfxEls = new Map();   // name -> HTMLAudioElement (uno por sonido)
+const SFX_POOL = 2;
+const sfxPool = new Map();   // name -> { els: HTMLAudioElement[], idx: number }
 
-function getSfxEl(name) {
-  let a = sfxEls.get(name);
-  if (!a) {
-    a = new Audio(`sounds/${name}.mp3`);
-    a.preload = 'auto';
-    try { a.load(); } catch (_) {}
-    sfxEls.set(name, a);
+function getSfxPool(name) {
+  let pool = sfxPool.get(name);
+  if (!pool) {
+    const els = [];
+    for (let i = 0; i < SFX_POOL; i++) {
+      const a = new Audio(`sounds/${name}.mp3`);
+      a.preload = 'auto';
+      try { a.load(); } catch (_) {}
+      els.push(a);
+    }
+    pool = { els, idx: 0 };
+    sfxPool.set(name, pool);
   }
-  return a;
+  return pool;
 }
 
-// Desbloqueo SECUENCIAL (uno por vez) para no superar el límite de audios
-// simultáneos del WebView. Reproduce cada sonido en mudo y lo pausa; a partir
-// de ahí puede volver a sonar sin necesidad de un gesto nuevo.
+// Desbloqueo FIRE-AND-FORGET: reproducimos en mudo la 1ª instancia de cada
+// sonido (sin esperar a nada). Un play exitoso dentro del gesto habilita el
+// audio del documento, y todas las instancias quedan cargadas para reproducir.
 let sfxUnlocked = false;
 function unlockSfx() {
   if (sfxUnlocked) return;
   sfxUnlocked = true;
-  const names = SFX_NAMES.slice();
-  let i = 0;
-  function next() {
-    if (i >= names.length) return;
-    const a = getSfxEl(names[i++]);
+  SFX_NAMES.forEach(n => {
+    const a = getSfxPool(n).els[0];
     try {
       a.muted = true;
       const p = a.play();
       if (p && typeof p.then === 'function') {
-        p.then(() => { try { a.pause(); a.currentTime = 0; a.muted = false; } catch (_) {} next(); })
-         .catch(() => { try { a.muted = false; } catch (_) {} next(); });
+        p.then(() => { try { a.pause(); a.currentTime = 0; a.muted = false; } catch (_) {} })
+         .catch(() => { try { a.muted = false; } catch (_) {} });
       } else {
         try { a.pause(); a.currentTime = 0; } catch (_) {}
         a.muted = false;
-        next();
       }
-    } catch (_) { next(); }
-  }
-  next();
+    } catch (_) {}
+  });
+}
+
+function playOne(a, volume) {
+  a.muted = false;
+  a.volume = volume;
+  try { a.currentTime = 0; } catch (_) {}
+  return a.play();
 }
 
 function playSfx(name, volume = 0.9) {
   if (!soundConfig.effects) return;
   try {
-    const a = getSfxEl(name);
-    a.muted = false;
-    a.volume = volume;
-    try { a.currentTime = 0; } catch (_) {}
-    const p = a.play();
+    const pool = getSfxPool(name);
+    const a = pool.els[pool.idx];
+    pool.idx = (pool.idx + 1) % pool.els.length;
+    const p = playOne(a, volume);
     if (p && typeof p.catch === 'function') {
       p.catch(() => {
-        // Reintento: recargar el elemento y reproducir de nuevo.
+        // Reintento con la OTRA instancia del pool (evita el problema de
+        // interrumpir el mismo <audio> en reproducciones rápidas).
         try {
-          a.load();
-          a.currentTime = 0;
-          const p2 = a.play();
-          if (p2 && typeof p2.catch === 'function') p2.catch(() => {});
+          const b = pool.els[pool.idx];
+          pool.idx = (pool.idx + 1) % pool.els.length;
+          const p2 = playOne(b, volume);
+          if (p2 && typeof p2.catch === 'function') {
+            // Último recurso: recargar y reintentar.
+            p2.catch(() => { try { b.load(); const p3 = playOne(b, volume); if (p3 && p3.catch) p3.catch(() => {}); } catch (_) {} });
+          }
         } catch (_) {}
       });
     }
@@ -854,7 +864,7 @@ let sfxPreloaded = false;
 function preloadSfx() {
   if (sfxPreloaded) return;
   sfxPreloaded = true;
-  SFX_NAMES.forEach(n => getSfxEl(n));
+  SFX_NAMES.forEach(n => getSfxPool(n));
 }
 
 // Desbloqueo de audio desde los gestos del LOBBY (App.jsx): conectar, invitar,
@@ -1951,21 +1961,40 @@ function JugarTab({ multiplayer = null }) {
   // de inicio estilo juego de pelea para avisar que empezó.
   const [started, setStarted] = useState(false);
   const startedRef = useRef(false);
-  const [goAnim, setGoAnim] = useState(false);
-  const goTimerRef = useRef(null);
+  // Intro: secuencia "3 → 2 → 1 → ¡A LAS ARMAS!" (~2 s, un poco más rápida que
+  // los segundos reales). La partida (relojes + jugar) recién se habilita cuando
+  // aparece "¡A LAS ARMAS!".
+  const [goText, setGoText] = useState(null);   // null | '3' | '2' | '1' | '¡A LAS ARMAS!'
+  const introRef = useRef(false);
+  const introTimersRef = useRef([]);
 
-  function triggerGo() {
-    setGoAnim(true);
-    if (goTimerRef.current) clearTimeout(goTimerRef.current);
-    goTimerRef.current = setTimeout(() => setGoAnim(false), 1500);
+  function clearIntroTimers() {
+    introTimersRef.current.forEach(t => clearTimeout(t));
+    introTimersRef.current = [];
+  }
+
+  function runIntro() {
+    clearIntroTimers();
+    // Cuenta regresiva: cada número ~450 ms, y el cartel final ~650 ms → ~2 s.
+    setGoText('3');
+    const t = introTimersRef.current;
+    t.push(setTimeout(() => setGoText('2'), 450));
+    t.push(setTimeout(() => setGoText('1'), 900));
+    t.push(setTimeout(() => {
+      setGoText('¡A LAS ARMAS!');
+      // Recién acá se habilita jugar y arrancan los relojes.
+      startedRef.current = true;
+      setStarted(true);
+      introRef.current = false;
+    }, 1350));
+    t.push(setTimeout(() => setGoText(null), 2000)); // ocultar cartel
   }
 
   function startMatch() {
-    if (startedRef.current) return;
-    startedRef.current = true;
-    setStarted(true);     // dispara el efecto de relojes (abre el 1er segmento)
-    ensureAudio();        // desbloquea/recalienta el audio dentro del gesto
-    triggerGo();
+    if (startedRef.current || introRef.current) return;
+    introRef.current = true;
+    ensureAudio();   // desbloquea el audio dentro del gesto
+    runIntro();      // 3, 2, 1, ¡A LAS ARMAS! → al final setStarted(true)
   }
 
   function clockSnapshot() {
@@ -2168,9 +2197,12 @@ function JugarTab({ multiplayer = null }) {
     resetClocks();
     // Volver al estado "sin empezar": contra la IA reaparece el botón Comenzar.
     // Online se vuelve a iniciar solo (efecto de multiplayer), con su cartel.
-    setGoAnim(false);
-    if (multiplayer) { startedRef.current = false; setStarted(false); startMatch(); }
-    else { startedRef.current = false; setStarted(false); }
+    clearIntroTimers();
+    setGoText(null);
+    introRef.current = false;
+    startedRef.current = false;
+    setStarted(false);
+    if (multiplayer) startMatch();
   }
 
   const selectedPiece = selectedId ? pieces.find(p => p.id === selectedId && !p.captured) : null;
@@ -3063,7 +3095,7 @@ function JugarTab({ multiplayer = null }) {
         // La dificultad se bloquea apenas ARRANCA la partida (al apretar
         // "COMENZAR PARTIDA"), o si ya se hizo algún movimiento. Para cambiarla
         // hay que REINICIAR y elegir antes de empezar.
-        const difficultyLocked = started || turnNumber > 0;
+        const difficultyLocked = started || goText !== null || turnNumber > 0;
         return (
         <div style={{
           background: COLORS.card, borderRadius: 10, padding: '10px 12px',
@@ -3281,7 +3313,7 @@ function JugarTab({ multiplayer = null }) {
       )}
 
       {/* Botón COMENZAR PARTIDA (solo vs IA y antes de empezar) */}
-      {!multiplayer && !started && (
+      {!multiplayer && !started && !goText && (
         <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 4 }}>
           <button onClick={startMatch} style={{
             width: '100%', maxWidth: 420, padding: '14px 18px',
@@ -3309,23 +3341,30 @@ function JugarTab({ multiplayer = null }) {
           <div style={{
             position: 'relative', width: boardSize, height: boardSize, background: '#000',
           }}>
-            {/* Cartel de inicio "¡A LAS ARMAS!" (estilo juego de pelea) */}
-            {goAnim && (
+            {/* Intro: cuenta regresiva 3·2·1 y luego ¡A LAS ARMAS! */}
+            {goText && (
               <div style={{
                 position: 'absolute', inset: 0, zIndex: 50,
                 display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
                 pointerEvents: 'none',
-                background: 'radial-gradient(circle at center, rgba(0,0,0,0.35) 0%, rgba(0,0,0,0) 70%)',
+                background: 'radial-gradient(circle at center, rgba(0,0,0,0.45) 0%, rgba(0,0,0,0) 72%)',
               }}>
-                <div style={{
-                  fontFamily: 'Cinzel, serif', fontWeight: 700,
-                  fontSize: Math.max(28, Math.floor(boardSize / 9)),
-                  letterSpacing: 3, color: COLORS.goldBright,
-                  textShadow: `0 0 18px ${COLORS.gold}, 0 3px 6px #000, 0 0 40px ${COLORS.crimson}`,
-                  animation: 'realezaGo 1.5s ease-out forwards',
-                  textAlign: 'center', lineHeight: 1.1,
-                }}>
-                  ¡A LAS ARMAS!
+                <div
+                  key={goText}
+                  style={{
+                    fontFamily: 'Cinzel, serif', fontWeight: 700,
+                    fontSize: goText === '¡A LAS ARMAS!'
+                      ? Math.max(28, Math.floor(boardSize / 9))
+                      : Math.max(64, Math.floor(boardSize / 3)),
+                    letterSpacing: goText === '¡A LAS ARMAS!' ? 3 : 1,
+                    color: COLORS.goldBright,
+                    textShadow: `0 0 18px ${COLORS.gold}, 0 3px 6px #000, 0 0 40px ${COLORS.crimson}`,
+                    animation: goText === '¡A LAS ARMAS!'
+                      ? 'realezaGo 0.65s ease-out forwards'
+                      : 'realezaCount 0.45s ease-out forwards',
+                    textAlign: 'center', lineHeight: 1.05,
+                  }}>
+                  {goText}
                 </div>
               </div>
             )}
@@ -3534,7 +3573,8 @@ function Realeza() {
 @keyframes realezaBurst { 0% { transform: translate(-50%,-50%) scale(0.2); opacity: 0.9; } 100% { transform: translate(-50%,-50%) scale(2.4); opacity: 0; } }
 @keyframes realezaSprout { 0%,100% { box-shadow: 0 0 0 0 rgba(127,175,107,0.0); } 50% { box-shadow: 0 0 10px 3px rgba(127,175,107,0.7); } }
 @keyframes realezaBolt { 0% { box-shadow: 0 0 4px 1px currentColor; } 50% { box-shadow: 0 0 12px 5px currentColor; } 100% { box-shadow: 0 0 4px 1px currentColor; } }
-@keyframes realezaGo { 0% { transform: scale(0.2); opacity: 0; } 22% { transform: scale(1.18); opacity: 1; } 60% { transform: scale(1); opacity: 1; } 80% { transform: scale(1.04); opacity: 1; } 100% { transform: scale(1.5); opacity: 0; } }`;
+@keyframes realezaGo { 0% { transform: scale(0.2); opacity: 0; } 22% { transform: scale(1.18); opacity: 1; } 60% { transform: scale(1); opacity: 1; } 80% { transform: scale(1.04); opacity: 1; } 100% { transform: scale(1.5); opacity: 0; } }
+@keyframes realezaCount { 0% { transform: scale(1.8); opacity: 0; } 28% { transform: scale(1); opacity: 1; } 78% { transform: scale(1); opacity: 1; } 100% { transform: scale(0.82); opacity: 0; } }`;
       document.head.appendChild(style);
     }
   }, []);
