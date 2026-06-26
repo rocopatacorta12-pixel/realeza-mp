@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import Realeza, { JugarTab } from './components/Realeza.jsx';
+import Realeza, { JugarTab, primeRealezaAudio } from './components/Realeza.jsx';
 import { useMultiplayer } from './components/useMultiplayer.js';
 
 // === CONFIGURACIÓN ===
@@ -83,6 +83,7 @@ function OnlineSetup({ onConnect, onCancel, lastError }) {
   function handleConnect() {
     const cleanName = name.trim().slice(0, 24);
     if (!cleanName) return;
+    primeRealezaAudio(); // desbloquear audio dentro de este gesto (clave para el rival)
     saveToStorage(STORAGE_KEY_NAME, cleanName);
     saveToStorage(STORAGE_KEY_SERVER, serverUrl);
     onConnect(serverUrl, cleanName);
@@ -198,6 +199,7 @@ function Lobby({ mp, onLeave }) {
   }, [mp]);
 
   function invite(socketId) {
+    primeRealezaAudio(); // desbloquear audio en este gesto (antes de la partida)
     setPendingInviteId(socketId);
     mp.invite(socketId);
   }
@@ -246,7 +248,7 @@ function Lobby({ mp, onLeave }) {
             ⚔ {mp.incomingInvite.fromName} te invitó a jugar
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
-            <button onClick={() => mp.accept(mp.incomingInvite.fromSocketId)} style={{
+            <button onClick={() => { primeRealezaAudio(); mp.accept(mp.incomingInvite.fromSocketId); }} style={{
               flex: 1, padding: '10px',
               background: COLORS.green, color: '#0F1722',
               border: 'none', borderRadius: 6,

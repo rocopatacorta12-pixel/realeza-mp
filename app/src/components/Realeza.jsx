@@ -762,86 +762,77 @@ function setAmbient(on) {
 
 // =====================================================================
 // === SFX por archivo mp3 (carpeta /public/sounds, 17 archivos) ===
-// Estrategia POOL (HTMLAudio, igual familia que la v11 que SÍ suena en la app,
-// NO Web Audio). Por cada sonido mantenemos varios elementos <audio> creados y
-// CARGADOS una sola vez al inicio, y los "desbloqueamos" en el primer gesto.
-// Después se REUSAN (no creamos elementos nuevos): así siempre están listos y
-// suenan al instante, también al RECIBIR la jugada del rival en online —donde
-// no hay un gesto del usuario—. Esto arregla la intermitencia de la v11, que
-// usaba cloneNode() (creaba un <audio> nuevo cada vez, que a veces no había
-// terminado de cargar → no sonaba, de forma aparentemente aleatoria).
+// HTMLAudio (lo único que suena bien en este WebView; Web Audio quedaba mudo).
+// UN solo elemento <audio> por sonido, precargado y "desbloqueado" en el primer
+// gesto del usuario. Se reusa siempre (no clonamos ni creamos nuevos), así está
+// siempre listo para sonar al instante —incluido al RECIBIR la jugada del rival
+// en online, donde no hay un gesto en ese momento—.
+//
+// Por qué al rival le sonaban "algunas sí y otras no":
+//   1) Desbloquear 51 audios a la vez superaba el límite de reproducciones
+//      simultáneas del WebView y dejaba varios "muertos" (sin desbloquear).
+//      → Ahora hay 17 elementos (uno por sonido) y se desbloquean DE A UNO.
+//   2) El auto-arranque online llamaba al desbloqueo FUERA de un gesto y marcaba
+//      el audio como "ya desbloqueado" aunque fallaba, tapando el desbloqueo real.
+//      → Ahora se desbloquea desde los gestos del lobby (primeRealezaAudio).
 // Respeta soundConfig.effects (toggle de "Sonidos de piezas").
 // =====================================================================
-const SFX_POOL_SIZE = 3;     // instancias por sonido (para solapamientos del mismo sonido)
-const sfxPool = new Map();   // name -> { els: HTMLAudioElement[], idx: number }
+const sfxEls = new Map();   // name -> HTMLAudioElement (uno por sonido)
 
-function getSfxPool(name) {
-  let pool = sfxPool.get(name);
-  if (!pool) {
-    const els = [];
-    for (let i = 0; i < SFX_POOL_SIZE; i++) {
-      const a = new Audio(`sounds/${name}.mp3`);
-      a.preload = 'auto';
-      try { a.load(); } catch (_) {}
-      els.push(a);
-    }
-    pool = { els, idx: 0 };
-    sfxPool.set(name, pool);
+function getSfxEl(name) {
+  let a = sfxEls.get(name);
+  if (!a) {
+    a = new Audio(`sounds/${name}.mp3`);
+    a.preload = 'auto';
+    try { a.load(); } catch (_) {}
+    sfxEls.set(name, a);
   }
-  return pool;
-}
-
-// Compatibilidad: por si algún código viejo pide un Audio "base".
-const sfxCache = new Map();
-function getBaseAudio(name) {
-  if (sfxCache.has(name)) return sfxCache.get(name);
-  const a = new Audio(`sounds/${name}.mp3`);
-  a.preload = 'auto';
-  sfxCache.set(name, a);
   return a;
 }
 
-// Desbloqueo en el PRIMER gesto del usuario: reproducir+pausar en mudo cada
-// elemento del pool. Una vez desbloqueados, pueden volver a sonar sin gesto.
+// Desbloqueo SECUENCIAL (uno por vez) para no superar el límite de audios
+// simultáneos del WebView. Reproduce cada sonido en mudo y lo pausa; a partir
+// de ahí puede volver a sonar sin necesidad de un gesto nuevo.
 let sfxUnlocked = false;
 function unlockSfx() {
   if (sfxUnlocked) return;
   sfxUnlocked = true;
-  SFX_NAMES.forEach(n => {
-    const pool = getSfxPool(n);
-    pool.els.forEach(a => {
-      try {
-        a.muted = true;
-        const p = a.play();
-        if (p && typeof p.then === 'function') {
-          p.then(() => { try { a.pause(); a.currentTime = 0; a.muted = false; } catch (_) {} })
-           .catch(() => { try { a.muted = false; } catch (_) {} });
-        } else {
-          try { a.pause(); a.currentTime = 0; } catch (_) {}
-          a.muted = false;
-        }
-      } catch (_) {}
-    });
-  });
+  const names = SFX_NAMES.slice();
+  let i = 0;
+  function next() {
+    if (i >= names.length) return;
+    const a = getSfxEl(names[i++]);
+    try {
+      a.muted = true;
+      const p = a.play();
+      if (p && typeof p.then === 'function') {
+        p.then(() => { try { a.pause(); a.currentTime = 0; a.muted = false; } catch (_) {} next(); })
+         .catch(() => { try { a.muted = false; } catch (_) {} next(); });
+      } else {
+        try { a.pause(); a.currentTime = 0; } catch (_) {}
+        a.muted = false;
+        next();
+      }
+    } catch (_) { next(); }
+  }
+  next();
 }
 
 function playSfx(name, volume = 0.9) {
   if (!soundConfig.effects) return;
   try {
-    const pool = getSfxPool(name);
-    const a = pool.els[pool.idx];
-    pool.idx = (pool.idx + 1) % pool.els.length;
-    try { a.currentTime = 0; } catch (_) {}
+    const a = getSfxEl(name);
     a.muted = false;
     a.volume = volume;
+    try { a.currentTime = 0; } catch (_) {}
     const p = a.play();
     if (p && typeof p.catch === 'function') {
       p.catch(() => {
-        // Respaldo (igual que la v11): un <audio> nuevo por si el del pool falló.
+        // Reintento: recargar el elemento y reproducir de nuevo.
         try {
-          const fresh = new Audio(`sounds/${name}.mp3`);
-          fresh.volume = volume;
-          const p2 = fresh.play();
+          a.load();
+          a.currentTime = 0;
+          const p2 = a.play();
           if (p2 && typeof p2.catch === 'function') p2.catch(() => {});
         } catch (_) {}
       });
@@ -863,8 +854,16 @@ let sfxPreloaded = false;
 function preloadSfx() {
   if (sfxPreloaded) return;
   sfxPreloaded = true;
-  // Crear y cargar por adelantado los pools de cada sonido (quedan listos).
-  SFX_NAMES.forEach(n => { getSfxPool(n); });
+  SFX_NAMES.forEach(n => getSfxEl(n));
+}
+
+// Desbloqueo de audio desde los gestos del LOBBY (App.jsx): conectar, invitar,
+// aceptar. Clave para que el RIVAL (receptor) escuche desde el primer movimiento,
+// porque desbloquea dentro de un gesto real ANTES de entrar a la partida.
+export function primeRealezaAudio() {
+  try { preloadSfx(); } catch (_) {}
+  try { unlockSfx(); } catch (_) {}
+  try { if (typeof Tone !== 'undefined' && Tone && Tone.start) Tone.start(); } catch (_) {}
 }
 
 async function ensureAudio() {
